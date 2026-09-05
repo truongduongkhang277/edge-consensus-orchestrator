@@ -1,0 +1,9 @@
+{
+  "patient-api": {
+    "image": "nginx:alpine",
+    "container_port": 80,
+    "environment": {
+      "SERVICE_NAME": "patient-api"
+    }
+  }
+}

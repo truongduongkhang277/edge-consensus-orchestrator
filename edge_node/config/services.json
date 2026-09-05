@@ -1,0 +1,19 @@
+{
+  "patient-api": {
+    "image": "edge-patient-api:1.0",
+    "container_port": 8080,
+    "health_path": "/health",
+    "cpu_limit": 0.25,
+    "memory_limit_mb": 256,
+    "environment": {
+      "APP_ENV": "demo"
+    }
+  },
+  "lab-result-api": {
+    "image": "edge-lab-result-api:1.0",
+    "container_port": 8080,
+    "health_path": "/health",
+    "cpu_limit": 0.5,
+    "memory_limit_mb": 512
+  }
+}

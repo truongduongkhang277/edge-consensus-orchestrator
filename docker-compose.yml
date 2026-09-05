@@ -1,0 +1,22 @@
+services:
+  edge-1:
+    build: .
+    command: ["python", "-m", "edge_node", "--id", "edge-1", "--port", "8000", "--peers", "edge-2=http://edge-2:8000,edge-3=http://edge-3:8000"]
+    ports: ["8001:8000"]
+    volumes: ["edge1-data:/data"]
+  edge-2:
+    build: .
+    command: ["python", "-m", "edge_node", "--id", "edge-2", "--port", "8000", "--peers", "edge-1=http://edge-1:8000,edge-3=http://edge-3:8000"]
+    ports: ["8002:8000"]
+    volumes: ["edge2-data:/data"]
+  edge-3:
+    build: .
+    command: ["python", "-m", "edge_node", "--id", "edge-3", "--port", "8000", "--peers", "edge-1=http://edge-1:8000,edge-2=http://edge-2:8000"]
+    ports: ["8003:8000"]
+    volumes: ["edge3-data:/data"]
+
+volumes:
+  edge1-data:
+  edge2-data:
+  edge3-data:
+
