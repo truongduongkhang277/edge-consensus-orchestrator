@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "version": 1,
+  "execution": {
+    "defaultMode": "dry-run",
+    "maxIterations": 2,
+    "maxClaudeCalls": 1,
+    "requireCleanWorktree": true,
+    "createIsolatedWorktree": true,
+    "runDirectory": ".ai-runs",
+    "branchPrefix": "ai/automation-",
+    "stopOnTestFailure": false,
+    "approvalMarker": "VERDICT: APPROVED"
+  },
+  "safety": {
+    "allowedChangedPaths": [
+      "edge_node/**",
+      "tests/**",
+      "automation/**",
+      "README.md",
+      "ARCHITECTURE.md",
+      "PAPER_ALIGNMENT.md",
+      "REFACTOR_PLAN.md",
+      "requirements.txt"
+    ],
+    "protectedPaths": [
+      ".git/**",
+      ".env",
+      ".env.*",
+      "*.pem",
+      "*.key",
+      "**/*.pem",
+      "**/*.key",
+      "credentials/**",
+      "secrets/**",
+      "**/credentials/**",
+      "**/secrets/**"
+    ],
+    "maxChangedFiles": 20,
+    "maxDiffLines": 1000,
+    "forbiddenGitArguments": [
+      "commit",
+      "push",
+      "merge",
+      "rebase",
+      "reset",
+      "clean",
+      "checkout",
+      "switch",
+      "restore",
+      "add",
+      "rm",
+      "mv",
+      "worktree",
+      "branch -d",
+      "tag",
+      "config",
+      "remote",
+      "submodule",
+      "checkout --",
+      "reset --hard",
+      "clean -f",
+      "push --force",
+      "push -f"
+    ],
+    "neverCommit": true,
+    "neverPush": true,
+    "neverMerge": true
+  },
+  "agents": {
+    "deepseekAnalysis": {
+      "command": "npx.cmd",
+      "arguments": [
+        "@deepseek-ai/dsh",
+        "--profile",
+        "headless"
+      ],
+      "prompt": "automation/prompts/deepseek-analysis.md",
+      "timeoutSeconds": 900
+    },
+    "codexImplementation": {
+      "command": "codex",
+      "arguments": [
+        "exec",
+        "--sandbox",
+        "workspace-write",
+        "-"
+      ],
+      "prompt": "automation/prompts/codex-implementation.md",
+      "timeoutSeconds": 1800
+    },
+    "deepseekTestTriage": {
+      "command": "npx.cmd",
+      "arguments": [
+        "@deepseek-ai/dsh",
+        "--profile",
+        "headless"
+      ],
+      "prompt": "automation/prompts/deepseek-test-triage.md",
+      "timeoutSeconds": 900
+    },
+    "claudeReview": {
+      "command": "claude",
+      "arguments": [
+        "--print"
+      ],
+      "prompt": "automation/prompts/claude-review.md",
+      "timeoutSeconds": 1200
+    }
+  },
+  "tests": [
+    {
+      "name": "python-unittest",
+      "command": "python",
+      "arguments": [
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-v"
+      ],
+      "timeoutSeconds": 900
+    },
+    {
+      "name": "python-compileall",
+      "command": "python",
+      "arguments": [
+        "-m",
+        "compileall",
+        "-q",
+        "edge_node",
+        "tests"
+      ],
+      "timeoutSeconds": 300
+    }
+  ]
+}
