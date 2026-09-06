@@ -23,6 +23,33 @@ function Invoke-GuardCase {
     Write-Host "PASS: $Name"
 }
 
+function Invoke-LegacyNativeCaptureForTest {
+    param(
+        [Parameter(Mandatory = $true)][string]$Command,
+        [string[]]$Arguments = @(),
+        [Parameter(Mandatory = $true)][string]$WorkingDirectory,
+        [Parameter(Mandatory = $true)][string]$StandardInput
+    )
+
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $Command
+    $startInfo.WorkingDirectory = $WorkingDirectory
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardInput = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.Arguments = (@($Arguments | ForEach-Object { ConvertTo-NativeArgument -Argument ([string]$_) }) -join ' ')
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    $process.Start() | Out-Null
+    $process.StandardInput.Write($StandardInput)
+    $process.StandardInput.Close()
+    $stdout = $process.StandardOutput.ReadToEndAsync()
+    $stderr = $process.StandardError.ReadToEndAsync()
+    $process.WaitForExit(10000) | Out-Null
+    return [pscustomobject]@{ ExitCode = $process.ExitCode; StdOut = $stdout.Result; StdErr = $stderr.Result }
+}
+
 $oldLibraryMode = $env:AGENT_LOOP_LIBRARY_ONLY
 try {
     $env:AGENT_LOOP_LIBRARY_ONLY = '1'
@@ -34,6 +61,48 @@ finally {
 
 try {
     New-Item -ItemType Directory -Path $temporaryRoot -Force | Out-Null
+    $stdinEncodingProperty = ([System.Diagnostics.ProcessStartInfo]::new()).GetType().GetProperty('StandardInputEncoding')
+    $script:stdinTransportAvailable = ($null -ne $stdinEncodingProperty)
+    if (-not $script:stdinTransportAvailable) {
+        $unsupportedStdinFailure = $false
+        try { Invoke-NativeCapture -Command 'powershell.exe' -WorkingDirectory $repositoryRoot -StandardInput 'stdin capability probe' | Out-Null }
+        catch { $unsupportedStdinFailure = $_.Exception.Message -match 'StandardInputEncoding' }
+        Assert-True $unsupportedStdinFailure 'Missing StandardInputEncoding did not fail clearly.'
+        Write-Host 'SKIP: UTF-8 stdin child-process regression test (runtime lacks StandardInputEncoding)'
+    }
+    else {
+        $stdinPrompt = ('Ch' + [char]0x1ec9 + ' ' + [char]0x0111 + [char]0x1ecd + 'c README.md ' + [char]0x2013 + ' ki' + [char]0x1ec3 + 'm th' + [char]0x1eed + ' ' + 'ti' + [char]0x1ebf + 'ng Vi' + [char]0x1ec7 + 't' + [Environment]::NewLine + '"' + ' & | ;')
+        $expectedBase64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($stdinPrompt))
+        $stdinChildScript = @(
+            ('$expectedBase64 = "' + $expectedBase64 + '"')
+            '$stream = [Console]::OpenStandardInput()'
+            '$buffer = [System.IO.MemoryStream]::new()'
+            '$stream.CopyTo($buffer)'
+            '$bytes = $buffer.ToArray()'
+            '$hasBom = $bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF'
+            '$utf8 = [System.Text.UTF8Encoding]::new($false, $true)'
+            'try {'
+            '    $text = $utf8.GetString($bytes)'
+            '    $matchesExpected = [Convert]::ToBase64String($bytes) -eq $expectedBase64'
+            '    if (-not $hasBom -and $matchesExpected -and $text.Length -gt 0) { ''VALID_UTF8_NO_BOM''; exit 0 }'
+            '    ''INVALID_UTF8_OR_BOM''; exit 7'
+            '}'
+            'catch {'
+            '    ''INVALID_UTF8''; exit 8'
+            '}'
+        ) -join [Environment]::NewLine
+        $stdinChildPath = Join-Path $temporaryRoot 'stdin-byte-check.ps1'
+        Set-Content -LiteralPath $stdinChildPath -Value $stdinChildScript -Encoding utf8
+        $stdinChildArguments = @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $stdinChildPath)
+        Assert-True ((($stdinChildArguments -join ' ') -notlike "*$stdinPrompt*") -and ($stdinChildScript -notlike "*$stdinPrompt*")) 'Prompt appeared in child command line or generated log content.'
+        $utf8StdinResult = Invoke-NativeCapture -Command (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') -Arguments $stdinChildArguments -WorkingDirectory $repositoryRoot -StandardInput $stdinPrompt -TimeoutSeconds 10
+        Assert-True ($utf8StdinResult.ExitCode -eq 0 -and $utf8StdinResult.StdOut.Trim() -eq 'VALID_UTF8_NO_BOM') 'UTF-8 stdin child-process validation failed.'
+        Assert-True (($utf8StdinResult.StdOut -notlike "*$stdinPrompt*") -and ($utf8StdinResult.StdErr -notlike "*$stdinPrompt*")) 'Prompt appeared in child-process output/log.'
+        $legacyStdinResult = Invoke-LegacyNativeCaptureForTest -Command (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') -Arguments $stdinChildArguments -WorkingDirectory $repositoryRoot -StandardInput $stdinPrompt
+        Assert-True ($legacyStdinResult.ExitCode -ne 0) 'Legacy default stdin encoding unexpectedly passed the UTF-8 regression test.'
+        Write-Host 'PASS: stdin uses UTF-8 without BOM and rejects legacy default encoding'
+    }
+
     foreach ($stageName in @('deepseekAnalysis', 'deepseekTestTriage')) {
         $stage = $policy.agents.$stageName
         Assert-True -Condition ($stage.command -eq 'npx.cmd') -Message "$stageName must use npx.cmd."
@@ -158,8 +227,16 @@ exit /b %ERRORLEVEL%
     $script:mockClaudeRootForTest = $mockRoot
     $script:mockClaudeCallFileForTest = $callFile
     $script:mockClaudeStdinForTest = $stdinFile
-    $mockClaudeInvocation = {
-        Invoke-AgentStage -Name 'mock Claude' -Configuration $script:mockClaudeConfigurationForTest -Prompt 'review via stdin' -WorkingDirectory $script:mockClaudeWorktreeForTest -OutputPath (Join-Path $script:mockClaudeRootForTest 'mock-claude-output.md') -Environment @{ MOCK_CALL_FILE = $script:mockClaudeCallFileForTest; MOCK_STDIN_FILE = $script:mockClaudeStdinForTest }
+    if ($script:stdinTransportAvailable) {
+        $mockClaudeInvocation = {
+            Invoke-AgentStage -Name 'mock Claude' -Configuration $script:mockClaudeConfigurationForTest -Prompt 'review via stdin' -WorkingDirectory $script:mockClaudeWorktreeForTest -OutputPath (Join-Path $script:mockClaudeRootForTest 'mock-claude-output.md') -Environment @{ MOCK_CALL_FILE = $script:mockClaudeCallFileForTest; MOCK_STDIN_FILE = $script:mockClaudeStdinForTest }
+        }
+    }
+    else {
+        $mockClaudeInvocation = {
+            [System.IO.File]::AppendAllText($script:mockClaudeCallFileForTest, "called`r`n")
+            [pscustomobject]@{ ExitCode = 0; Error = $null }
+        }
     }
 
     $claudeCalls = 0
@@ -176,12 +253,17 @@ exit /b %ERRORLEVEL%
     Assert-True ($passingGate.Called -and $passingExitCode -eq 0 -and -not $secondGate.Called -and $callLines.Count -eq 1) "Claude was not called exactly once after a passing gate (called=$($passingGate.Called), exit=$passingExitCode, second=$($secondGate.Called), lines=$($callLines.Count), error=$passingError)."
     Write-Host 'PASS: passing tests call Claude exactly once'
 
-    $claudeStdin = Get-Content -LiteralPath $stdinFile -Raw
-    Assert-True ($claudeStdin -eq 'review via stdin') 'Claude did not receive its prompt through stdin.'
-    $codexStdinFile = Join-Path $mockRoot 'codex-stdin.txt'
-    $codexStage = Invoke-AgentStage -Name 'mock Codex' -Configuration $script:mockClaudeConfigurationForTest -Prompt 'codex prompt via stdin' -WorkingDirectory $mockWorktree -OutputPath (Join-Path $mockRoot 'mock-codex-output.md') -Environment @{ MOCK_CALL_FILE = $callFile; MOCK_STDIN_FILE = $codexStdinFile }
-    Assert-True ($codexStage.ExitCode -eq 0 -and (Get-Content -LiteralPath $codexStdinFile -Raw) -eq 'codex prompt via stdin') 'Codex did not receive its prompt through stdin.'
-    Write-Host 'PASS: Codex and Claude prompts use stdin'
+    if ($script:stdinTransportAvailable) {
+        $claudeStdin = Get-Content -LiteralPath $stdinFile -Raw
+        Assert-True ($claudeStdin -eq 'review via stdin') 'Claude did not receive its prompt through stdin.'
+        $codexStdinFile = Join-Path $mockRoot 'codex-stdin.txt'
+        $codexStage = Invoke-AgentStage -Name 'mock Codex' -Configuration $script:mockClaudeConfigurationForTest -Prompt 'codex prompt via stdin' -WorkingDirectory $mockWorktree -OutputPath (Join-Path $mockRoot 'mock-codex-output.md') -Environment @{ MOCK_CALL_FILE = $callFile; MOCK_STDIN_FILE = $codexStdinFile }
+        Assert-True ($codexStage.ExitCode -eq 0 -and (Get-Content -LiteralPath $codexStdinFile -Raw) -eq 'codex prompt via stdin') 'Codex did not receive its prompt through stdin.'
+        Write-Host 'PASS: Codex and Claude prompts use stdin'
+    }
+    else {
+        Write-Host 'SKIP: Codex/Claude process stdin transport test (runtime lacks StandardInputEncoding)'
+    }
 
     $specialRequirement = "Yêu cầu `"đặc biệt`" & | ;`r`nkhông được chèn lệnh"
     $specialPrompt = "Requirement: $specialRequirement"

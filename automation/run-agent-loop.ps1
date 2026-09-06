@@ -66,8 +66,17 @@ function Invoke-NativeCapture {
     $startInfo.UseShellExecute = $false
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
-    $startInfo.RedirectStandardInput = $true
+    $hasStandardInput = $PSBoundParameters.ContainsKey('StandardInput')
+    $startInfo.RedirectStandardInput = $hasStandardInput
     $startInfo.CreateNoWindow = $true
+
+    if ($startInfo.RedirectStandardInput) {
+        if ($startInfo.GetType().GetProperty('StandardInputEncoding') -eq $null) {
+            throw 'This PowerShell/.NET runtime does not support ProcessStartInfo.StandardInputEncoding; refusing to use a default stdin encoding.'
+        }
+        $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+        $startInfo.StandardInputEncoding = $utf8NoBom
+    }
 
     # ProcessStartInfo.ArgumentList is unavailable in Windows PowerShell 5.1.
     $startInfo.Arguments = (@($Arguments | ForEach-Object { ConvertTo-NativeArgument -Argument ([string]$_) }) -join ' ')
@@ -91,10 +100,10 @@ function Invoke-NativeCapture {
         }
     }
 
-    if ($null -ne $StandardInput) {
+    if ($hasStandardInput) {
         $process.StandardInput.Write($StandardInput)
+        $process.StandardInput.Close()
     }
-    $process.StandardInput.Close()
 
     $stdoutTask = $process.StandardOutput.ReadToEndAsync()
     $stderrTask = $process.StandardError.ReadToEndAsync()
