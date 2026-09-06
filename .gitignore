@@ -29,7 +29,6 @@ edge_node/data-*/
 # Experiment output
 results/*
 !results/.gitkeep
-.ai-runs/
 *.csv
 *.summary.json
 
