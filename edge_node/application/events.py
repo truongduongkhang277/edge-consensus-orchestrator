@@ -4,6 +4,26 @@ from collections import deque
 from datetime import datetime
 
 
+def _print_safely(line: str) -> None:
+    """
+    Không để encoding của stdout làm gián đoạn luồng nghiệp vụ.
+    """
+
+    try:
+        print(line, flush=True)
+    except UnicodeEncodeError:
+        fallback_line = line.encode(
+            "ascii",
+            errors="backslashreplace"
+        ).decode("ascii")
+
+        try:
+            print(fallback_line, flush=True)
+        except UnicodeEncodeError:
+            # Sự kiện đã được lưu; lỗi console không được phá luồng gọi.
+            pass
+
+
 class EventRecorder:
     """
     Ghi lại sự kiện nghiệp vụ để hiển thị trên web và CMD.
@@ -44,12 +64,11 @@ class EventRecorder:
         with self.lock:
             self.items.appendleft(event)
 
-        print(
+        _print_safely(
             f"[{event['time']}] "
             f"[{self.node_id}] "
             f"[{kind}] "
-            f"{message}",
-            flush=True
+            f"{message}"
         )
 
     def get_all(self) -> list[dict]:
