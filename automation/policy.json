@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "version": 1,
+  "execution": {
+    "defaultMode": "dry-run",
+    "maxIterations": 3,
+    "requireCleanWorktree": true,
+    "createIsolatedWorktree": true,
+    "runDirectory": ".ai-runs",
+    "branchPrefix": "ai/automation-",
+    "stopOnTestFailure": false,
+    "approvalMarker": "VERDICT: APPROVED"
+  },
+  "safety": {
+    "allowedChangedPaths": [
+      "edge_node/**",
+      "tests/**",
+      "automation/**",
+      "README.md",
+      "ARCHITECTURE.md",
+      "PAPER_ALIGNMENT.md",
+      "REFACTOR_PLAN.md",
+      "requirements.txt"
+    ],
+    "protectedPaths": [
+      ".git/**",
+      ".env",
+      ".env.*",
+      "*.pem",
+      "*.key",
+      "**/*.pem",
+      "**/*.key",
+      "credentials/**",
+      "secrets/**",
+      "**/credentials/**",
+      "**/secrets/**"
+    ],
+    "maxChangedFiles": 40,
+    "forbiddenGitArguments": [
+      "reset --hard",
+      "clean -f",
+      "checkout --",
+      "push --force",
+      "push -f"
+    ],
+    "neverCommit": true,
+    "neverPush": true,
+    "neverMerge": true
+  },
+  "agents": {
+    "deepseekAnalysis": {
+      "command": "deepseek",
+      "arguments": [],
+      "prompt": "automation/prompts/deepseek-analysis.md",
+      "timeoutSeconds": 900
+    },
+    "codexImplementation": {
+      "command": "codex",
+      "arguments": [
+        "exec",
+        "--sandbox",
+        "workspace-write",
+        "-"
+      ],
+      "prompt": "automation/prompts/codex-implementation.md",
+      "timeoutSeconds": 1800
+    },
+    "deepseekTestTriage": {
+      "command": "deepseek",
+      "arguments": [],
+      "prompt": "automation/prompts/deepseek-test-triage.md",
+      "timeoutSeconds": 900
+    },
+    "claudeReview": {
+      "command": "claude",
+      "arguments": [
+        "--print"
+      ],
+      "prompt": "automation/prompts/claude-review.md",
+      "timeoutSeconds": 1200
+    }
+  },
+  "tests": [
+    {
+      "name": "python-unittest",
+      "command": "python",
+      "arguments": [
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-v"
+      ],
+      "timeoutSeconds": 900
+    }
+  ]
+}
