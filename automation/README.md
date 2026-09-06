@@ -36,7 +36,7 @@ Git wrapper không phải sandbox tuyệt đối: tiến trình có thể cố g
 - Chạy từ một Git repository sạch; lần chạy thật từ chối tiếp tục nếu worktree chính có thay đổi.
 - Các executable `git`, `python`, `codex`, `claude`, Node.js và `npx.cmd` phải có sẵn khi chạy thật. DeepSeek Harness phải khả dụng qua package `@deepseek-ai/dsh` phiên bản phù hợp.
 - Trước khi chạy agent, runner resolve từng CLI thành đường dẫn tuyệt đối bằng `Get-Command -CommandType Application` (hoặc kiểm tra trực tiếp nếu policy đã chứa đường dẫn tuyệt đối). Runner không hardcode thư mục cài Node.js; `-Execute` dừng trước khi tạo worktree nếu không resolve được executable.
-- Codex và Claude nhận prompt qua standard input UTF-8 không BOM; nếu runtime không có `StandardInputEncoding`, runner dừng rõ ràng thay vì dùng encoding mặc định. DeepSeek Harness headless nhận task positional; runner dùng task-file transport riêng được mô tả bên dưới.
+- Codex và Claude nhận prompt qua standard input UTF-8 không BOM. DeepSeek Harness headless nhận task positional; runner dùng task-file transport riêng được mô tả bên dưới.
 - Không đặt token hoặc credential trong policy, prompt hay command line. CLI tự quản lý xác thực bên ngoài repository.
 - Xem lại `allowedChangedPaths`, test command và timeout trước mỗi lần chạy thật.
 

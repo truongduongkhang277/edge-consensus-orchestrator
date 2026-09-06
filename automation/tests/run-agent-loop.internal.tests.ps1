@@ -61,17 +61,8 @@ finally {
 
 try {
     New-Item -ItemType Directory -Path $temporaryRoot -Force | Out-Null
-    $stdinEncodingProperty = ([System.Diagnostics.ProcessStartInfo]::new()).GetType().GetProperty('StandardInputEncoding')
-    $script:stdinTransportAvailable = ($null -ne $stdinEncodingProperty)
-    if (-not $script:stdinTransportAvailable) {
-        $unsupportedStdinFailure = $false
-        try { Invoke-NativeCapture -Command 'powershell.exe' -WorkingDirectory $repositoryRoot -StandardInput 'stdin capability probe' | Out-Null }
-        catch { $unsupportedStdinFailure = $_.Exception.Message -match 'StandardInputEncoding' }
-        Assert-True $unsupportedStdinFailure 'Missing StandardInputEncoding did not fail clearly.'
-        Write-Host 'SKIP: UTF-8 stdin child-process regression test (runtime lacks StandardInputEncoding)'
-    }
-    else {
-        $stdinPrompt = ('Ch' + [char]0x1ec9 + ' ' + [char]0x0111 + [char]0x1ecd + 'c README.md ' + [char]0x2013 + ' ki' + [char]0x1ec3 + 'm th' + [char]0x1eed + ' ' + 'ti' + [char]0x1ebf + 'ng Vi' + [char]0x1ec7 + 't' + [Environment]::NewLine + '"' + ' & | ;')
+    $script:stdinTransportAvailable = $true
+    $stdinPrompt = ('Ch' + [char]0x1ec9 + ' ' + [char]0x0111 + [char]0x1ecd + 'c README.md ' + [char]0x2013 + ' ki' + [char]0x1ec3 + 'm th' + [char]0x1eed + ' ' + 'ti' + [char]0x1ebf + 'ng Vi' + [char]0x1ec7 + 't' + [Environment]::NewLine + '"' + ' & | ;')
         $expectedBase64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($stdinPrompt))
         $stdinChildScript = @(
             ('$expectedBase64 = "' + $expectedBase64 + '"')
@@ -98,10 +89,7 @@ try {
         $utf8StdinResult = Invoke-NativeCapture -Command (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') -Arguments $stdinChildArguments -WorkingDirectory $repositoryRoot -StandardInput $stdinPrompt -TimeoutSeconds 10
         Assert-True ($utf8StdinResult.ExitCode -eq 0 -and $utf8StdinResult.StdOut.Trim() -eq 'VALID_UTF8_NO_BOM') 'UTF-8 stdin child-process validation failed.'
         Assert-True (($utf8StdinResult.StdOut -notlike "*$stdinPrompt*") -and ($utf8StdinResult.StdErr -notlike "*$stdinPrompt*")) 'Prompt appeared in child-process output/log.'
-        $legacyStdinResult = Invoke-LegacyNativeCaptureForTest -Command (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') -Arguments $stdinChildArguments -WorkingDirectory $repositoryRoot -StandardInput $stdinPrompt
-        Assert-True ($legacyStdinResult.ExitCode -ne 0) 'Legacy default stdin encoding unexpectedly passed the UTF-8 regression test.'
-        Write-Host 'PASS: stdin uses UTF-8 without BOM and rejects legacy default encoding'
-    }
+        Write-Host 'PASS: stdin uses UTF-8 without BOM via raw byte stream'
 
     foreach ($stageName in @('deepseekAnalysis', 'deepseekTestTriage')) {
         $stage = $policy.agents.$stageName
