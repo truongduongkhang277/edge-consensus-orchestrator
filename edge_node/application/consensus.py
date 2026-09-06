@@ -420,22 +420,6 @@ class RaftNode:
     def _election_loop(self):
         while self.running:
             time.sleep(0.1)
-
-            with self.lock:
-                role = self.role
-
-                expired = (
-                    time.monotonic()
-                    - self.last_heartbeat
-                    > self.election_timeout
-                )
-
-            if role == "leader":
-                self.send_heartbeats()
-                time.sleep(
-                    self.HEARTBEAT_INTERVAL_SECONDS
-                )
-
             # Leader chỉ tồn tại trong thời gian xử lý một orchestration
             # request. Không tự bầu leader khi hệ thống đang idle.
 
@@ -547,7 +531,7 @@ class RaftNode:
                         )
 
                     if not still_candidate:
-                        return
+                        return False
 
                     if result.get("vote_granted"):
                         votes += 1
@@ -590,18 +574,6 @@ class RaftNode:
         """Bầu một leader mới cho đúng một orchestration request."""
 
         with self.lock:
-            # Một số embedders khôi phục/tiêm một leader đã được bầu sẵn.
-            # Giữ quyền khởi tạo request đó nhưng vẫn mở term tạm thời mới;
-            # election mạng đầy đủ chỉ cần thiết khi node đang idle.
-            if self.role == "leader":
-                self.term += 1
-                self.voted_for = self.id
-                self.leader_id = self.id
-                self.last_heartbeat = time.monotonic()
-                self.election_timeout = self._new_timeout()
-                self._persist()
-                return True
-
             self.role = "follower"
             self.leader_id = None
 
@@ -1240,8 +1212,16 @@ class RaftNode:
         with self.orchestration_lock:
             lock_acquired = time.perf_counter()
             try:
-                self._open_temporary_leader()
-                status_code, result = self._orchestrate_serialized(command)
+                election_won = self._open_temporary_leader()
+                if not election_won:
+                    return_result = {
+                        "error": "Không đạt đa số",
+                        "acks": 0,
+                        "required": self.majority
+                    }
+                    status_code, result = 503, return_result
+                else:
+                    status_code, result = self._orchestrate_serialized(command)
             finally:
                 self._pause_after_orchestration()
 

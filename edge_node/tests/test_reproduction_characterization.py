@@ -1,6 +1,6 @@
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from edge_node.application.consensus import RaftNode
 from edge_node.domain.scheduler import ResourceScheduler
@@ -33,12 +33,22 @@ class ReproductionCharacterizationTests(unittest.TestCase):
             peers=configured_peers(count),
             data_dir=data_dir,
         )
-        node.role = "leader"
-        node.leader_id = node.id
-        node.term = 1
-        node.voted_for = node.id
         node.send_heartbeats = lambda: None
         return node
+
+    def grant_votes(self, node: RaftNode, granted: list[bool]) -> list[int]:
+        election_terms = []
+
+        def request_vote(peer_id, peer_url, payload):
+            election_terms.append(int(payload["term"]))
+            vote_granted = granted.pop(0)
+            return peer_id, {
+                "term": payload["term"],
+                "vote_granted": vote_granted,
+            }, None
+
+        node._request_vote_from_peer = request_vote
+        return election_terms
 
     def test_six_logical_nodes_are_reflected_in_status_and_quorum(self):
         with tempfile.TemporaryDirectory() as data_dir:
@@ -87,19 +97,63 @@ class ReproductionCharacterizationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as data_dir:
             node = self.make_node(data_dir, count=3)
             try:
+                self.grant_votes(node, [False, False])
                 node._request_reconcile = lambda: reconciled.append(True)
-                node._replicate_proposal = lambda entry, payload: 1
+                serialized = Mock(side_effect=AssertionError(
+                    "serialization must not run without election majority"
+                ))
+                node._orchestrate_serialized = serialized
 
                 status, result = node.orchestrate(deploy_command())
 
                 self.assertEqual(status, 503)
-                self.assertEqual(result["acks"], 1)
+                self.assertEqual(result["acks"], 0)
                 self.assertEqual(result["required"], 2)
+                serialized.assert_not_called()
                 self.assertEqual(node.commit_index, 0)
                 self.assertEqual(node.last_applied, 0)
                 self.assertEqual(node.log, [])
                 self.assertEqual(node.services, {})
                 self.assertEqual(reconciled, [])
+                self.assertEqual(node.role, "pause")
+            finally:
+                node.stop()
+
+    def test_three_node_majority_election_processes_request_and_next_request_opens_new_term(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            node = self.make_node(data_dir, count=3)
+            try:
+                election_terms = self.grant_votes(node, [True, True, True, True])
+                node._replicate_proposal = lambda entry, payload: 3
+
+                first_status, first = node.orchestrate(deploy_command())
+                second_status, second = node.orchestrate(deploy_command())
+
+                self.assertEqual(first_status, 201)
+                self.assertEqual(second_status, 201)
+                self.assertEqual(first["term"], 1)
+                self.assertEqual(second["term"], 2)
+                self.assertEqual(election_terms, [1, 1, 2, 2])
+                self.assertEqual(node.commit_index, 2)
+                self.assertEqual(node.role, "pause")
+            finally:
+                node.stop()
+
+    def test_stale_leader_role_must_still_request_votes_for_new_orchestration(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            node = self.make_node(data_dir, count=3)
+            try:
+                self.grant_votes(node, [True, True])
+                self.assertTrue(node.begin_election(send_heartbeat=False))
+                self.assertEqual(node.role, "leader")
+
+                election_terms = self.grant_votes(node, [True, True])
+                node._replicate_proposal = lambda entry, payload: 3
+                status, result = node.orchestrate(deploy_command())
+
+                self.assertEqual(status, 201)
+                self.assertEqual(result["term"], 2)
+                self.assertEqual(election_terms, [2, 2])
                 self.assertEqual(node.role, "pause")
             finally:
                 node.stop()
