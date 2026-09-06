@@ -101,6 +101,17 @@ curl http://localhost:8001/services
 
 ## Kiểm thử
 
+Chạy các lệnh sau từ thư mục gốc của repository. Repository có hai bộ test `unittest`:
+
 ```bash
+# Top-level tests
 python -m unittest discover -s tests -v
+
+# edge_node tests
+python -m unittest discover -s edge_node/tests -v
+
+# Chạy cả hai bộ (dừng nếu bộ đầu tiên thất bại)
+python -m unittest discover -s tests -v && python -m unittest discover -s edge_node/tests -v
 ```
+
+Không cần Docker để chạy các test này. Nếu môi trường chưa có dependency, có thể cài đặt từ `requirements.txt` trước khi chạy.
