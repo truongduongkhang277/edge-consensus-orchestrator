@@ -1,15 +1,14 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateNotNullOrEmpty()]
-    [string]$Task,
+    [string]$Requirement,
 
-    [ValidateRange(1, 20)]
-    [int]$MaxIterations = 0,
+    [ValidateRange(1, 2)]
+    [int]$MaxIterations,
 
     [switch]$Execute,
 
-    [string]$PolicyPath = (Join-Path $PSScriptRoot 'policy.json')
+    [string]$WorktreeRoot
 )
 
 Set-StrictMode -Version Latest
@@ -57,7 +56,8 @@ function Invoke-NativeCapture {
         [string[]]$Arguments = @(),
         [Parameter(Mandatory = $true)][string]$WorkingDirectory,
         [string]$StandardInput,
-        [int]$TimeoutSeconds = 600
+        [int]$TimeoutSeconds = 600,
+        [hashtable]$Environment = @{}
     )
 
     $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
@@ -74,8 +74,21 @@ function Invoke-NativeCapture {
 
     $process = [System.Diagnostics.Process]::new()
     $process.StartInfo = $startInfo
-    if (-not $process.Start()) {
-        throw "Could not start command: $Command"
+    $previousEnvironment = @{}
+    try {
+        foreach ($name in $Environment.Keys) {
+            $environmentName = [string]$name
+            $previousEnvironment[$environmentName] = [System.Environment]::GetEnvironmentVariable($environmentName, 'Process')
+            [System.Environment]::SetEnvironmentVariable($environmentName, [string]$Environment[$name], 'Process')
+        }
+        if (-not $process.Start()) {
+            throw "Could not start command: $Command"
+        }
+    }
+    finally {
+        foreach ($name in $previousEnvironment.Keys) {
+            [System.Environment]::SetEnvironmentVariable([string]$name, $previousEnvironment[$name], 'Process')
+        }
     }
 
     if ($null -ne $StandardInput) {
@@ -95,6 +108,89 @@ function Invoke-NativeCapture {
         StdOut = $stdoutTask.Result
         StdErr = $stderrTask.Result
     }
+}
+
+function Resolve-GitExecutable {
+    $command = Get-Command git.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1
+    $resolved = [System.IO.Path]::GetFullPath($command.Source)
+    if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) {
+        throw "Resolved git.exe does not exist: $resolved"
+    }
+    return $resolved
+}
+
+function New-GitGuard {
+    param(
+        [Parameter(Mandatory = $true)][string]$Directory,
+        [Parameter(Mandatory = $true)][string]$RealGitExecutable,
+        [Parameter(Mandatory = $true)][object[]]$ForbiddenArguments
+    )
+
+    New-Item -ItemType Directory -Path $Directory -Force | Out-Null
+    $escapedGit = $RealGitExecutable.Replace("'", "''")
+    $forbiddenLiterals = @($ForbiddenArguments | ForEach-Object { "    '" + ([string]$_).ToLowerInvariant().Replace("'", "''") + "'" }) -join ",`r`n"
+    $guardScript = @"
+param([Parameter(ValueFromRemainingArguments = `$true)][string[]]`$GitArguments)
+`$ErrorActionPreference = 'Stop'
+`$realGit = '$escapedGit'
+`$allowedCommands = @('status', 'diff', 'ls-files', 'log', 'show', 'rev-parse', 'grep')
+`$forbiddenArguments = @(
+$forbiddenLiterals
+)
+`$normalized = ((@(`$GitArguments) -join ' ').Trim().ToLowerInvariant() -replace '\s+', ' ')
+foreach (`$forbidden in `$forbiddenArguments) {
+    if (`$normalized -eq `$forbidden -or `$normalized.StartsWith(`$forbidden + ' ')) {
+        [Console]::Error.WriteLine("git guard: forbidden command: `$normalized")
+        exit 97
+    }
+}
+if (`$GitArguments.Count -eq 0 -or `$allowedCommands -notcontains `$GitArguments[0].ToLowerInvariant()) {
+    [Console]::Error.WriteLine("git guard: command is not in the read-only allowlist: `$normalized")
+    exit 97
+}
+& `$realGit @GitArguments
+exit `$LASTEXITCODE
+"@
+    Set-Content -LiteralPath (Join-Path $Directory 'git.ps1') -Value $guardScript -Encoding utf8
+    $guardCommand = @'
+@echo off
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0git.ps1" %*
+exit /b %ERRORLEVEL%
+'@
+    Set-Content -LiteralPath (Join-Path $Directory 'git.cmd') -Value $guardCommand -Encoding ascii
+}
+
+function Get-GitSnapshot {
+    param(
+        [Parameter(Mandatory = $true)][string]$WorkingDirectory,
+        [Parameter(Mandatory = $true)][string]$GitExecutable
+    )
+
+    $head = Invoke-NativeCapture -Command $GitExecutable -Arguments @('rev-parse', 'HEAD') -WorkingDirectory $WorkingDirectory
+    $branch = Invoke-NativeCapture -Command $GitExecutable -Arguments @('rev-parse', '--abbrev-ref', 'HEAD') -WorkingDirectory $WorkingDirectory
+    $status = Invoke-NativeCapture -Command $GitExecutable -Arguments @('status', '--porcelain=v1', '--untracked-files=all') -WorkingDirectory $WorkingDirectory
+    foreach ($result in @($head, $branch, $status)) {
+        if ($result.ExitCode -ne 0) { throw "Could not capture Git snapshot: $($result.StdErr)" }
+    }
+    return [pscustomobject]@{
+        Head = $head.StdOut.Trim()
+        Branch = $branch.StdOut.Trim()
+        Status = $status.StdOut.TrimEnd([char[]]@("`r", "`n"))
+    }
+}
+
+function Test-HasDeletedFiles {
+    param(
+        [Parameter(Mandatory = $true)][string]$WorkingDirectory,
+        [Parameter(Mandatory = $true)][string]$GitExecutable
+    )
+
+    $status = Invoke-NativeCapture -Command $GitExecutable -Arguments @('status', '--porcelain=v1', '--untracked-files=all') -WorkingDirectory $WorkingDirectory
+    if ($status.ExitCode -ne 0) { throw "Could not inspect deleted files: $($status.StdErr)" }
+    foreach ($line in ($status.StdOut -split "`r?`n")) {
+        if ($line.Length -ge 2 -and $line.Substring(0, 2) -match '[DR]') { return $true }
+    }
+    return $false
 }
 
 function Assert-RelativeRepositoryPath {
@@ -130,9 +226,12 @@ function Test-PathMatchesAnyGlob {
 }
 
 function Get-ChangedPaths {
-    param([Parameter(Mandatory = $true)][string]$WorkingDirectory)
+    param(
+        [Parameter(Mandatory = $true)][string]$WorkingDirectory,
+        [Parameter(Mandatory = $true)][string]$GitExecutable
+    )
 
-    $result = Invoke-NativeCapture -Command 'git' -Arguments @('status', '--porcelain=v1', '--untracked-files=all') -WorkingDirectory $WorkingDirectory
+    $result = Invoke-NativeCapture -Command $GitExecutable -Arguments @('status', '--porcelain=v1', '--untracked-files=all') -WorkingDirectory $WorkingDirectory
     if ($result.ExitCode -ne 0) {
         throw "git status failed: $($result.StdErr)"
     }
@@ -150,10 +249,11 @@ function Get-ChangedPaths {
 function Assert-ChangePolicy {
     param(
         [Parameter(Mandatory = $true)][string]$WorkingDirectory,
-        [Parameter(Mandatory = $true)]$Safety
+        [Parameter(Mandatory = $true)]$Safety,
+        [Parameter(Mandatory = $true)][string]$GitExecutable
     )
 
-    $changedPaths = @(Get-ChangedPaths -WorkingDirectory $WorkingDirectory)
+    $changedPaths = @(Get-ChangedPaths -WorkingDirectory $WorkingDirectory -GitExecutable $GitExecutable)
     if ($changedPaths.Count -gt [int]$Safety.maxChangedFiles) {
         throw "Changed file count $($changedPaths.Count) exceeds policy limit $($Safety.maxChangedFiles)."
     }
@@ -166,16 +266,27 @@ function Assert-ChangePolicy {
             throw "Changed path is outside the allowlist: $path"
         }
     }
+    if (Test-HasDeletedFiles -WorkingDirectory $WorkingDirectory -GitExecutable $GitExecutable) {
+        throw 'Deleted or renamed files are forbidden by policy.'
+    }
+    $reviewDiff = Get-ReviewDiff -WorkingDirectory $WorkingDirectory -GitExecutable $GitExecutable
+    $diffLineCount = if ([string]::IsNullOrEmpty($reviewDiff)) { 0 } else { @($reviewDiff -split "`r?`n").Count }
+    if ($diffLineCount -gt [int]$Safety.maxDiffLines) {
+        throw "Diff line count $diffLineCount exceeds policy limit $($Safety.maxDiffLines)."
+    }
     return $changedPaths
 }
 
 function Get-ReviewDiff {
-    param([Parameter(Mandatory = $true)][string]$WorkingDirectory)
+    param(
+        [Parameter(Mandatory = $true)][string]$WorkingDirectory,
+        [Parameter(Mandatory = $true)][string]$GitExecutable
+    )
 
-    $tracked = Invoke-NativeCapture -Command 'git' -Arguments @('diff', '--no-ext-diff', '--binary', 'HEAD') -WorkingDirectory $WorkingDirectory
+    $tracked = Invoke-NativeCapture -Command $GitExecutable -Arguments @('diff', '--no-ext-diff', '--binary', 'HEAD') -WorkingDirectory $WorkingDirectory
     if ($tracked.ExitCode -ne 0) { throw "Could not capture tracked diff: $($tracked.StdErr)" }
 
-    $untrackedResult = Invoke-NativeCapture -Command 'git' -Arguments @('ls-files', '--others', '--exclude-standard') -WorkingDirectory $WorkingDirectory
+    $untrackedResult = Invoke-NativeCapture -Command $GitExecutable -Arguments @('ls-files', '--others', '--exclude-standard') -WorkingDirectory $WorkingDirectory
     if ($untrackedResult.ExitCode -ne 0) { throw "Could not list untracked files: $($untrackedResult.StdErr)" }
 
     $sections = @($tracked.StdOut)
@@ -197,6 +308,70 @@ function Get-ReviewDiff {
     return ($sections -join "`n")
 }
 
+function Assert-AgentPostconditions {
+    param(
+        [Parameter(Mandatory = $true)]$BaselineMain,
+        [Parameter(Mandatory = $true)]$BaselineWorktree,
+        [Parameter(Mandatory = $true)][string]$MainRepository,
+        [Parameter(Mandatory = $true)][string]$Worktree,
+        [Parameter(Mandatory = $true)]$Safety,
+        [Parameter(Mandatory = $true)][string]$GitExecutable
+    )
+
+    $currentMain = Get-GitSnapshot -WorkingDirectory $MainRepository -GitExecutable $GitExecutable
+    $currentWorktree = Get-GitSnapshot -WorkingDirectory $Worktree -GitExecutable $GitExecutable
+    if ($currentMain.Head -ne $BaselineMain.Head) { throw 'SAFETY VIOLATION: main repository HEAD changed.' }
+    if ($currentMain.Branch -ne $BaselineMain.Branch) { throw 'SAFETY VIOLATION: main repository branch changed.' }
+    if ($currentMain.Status -ne $BaselineMain.Status) { throw 'SAFETY VIOLATION: main working tree status changed.' }
+    if ($currentWorktree.Head -ne $BaselineWorktree.Head) { throw 'SAFETY VIOLATION: isolated worktree HEAD changed.' }
+    if ($currentWorktree.Branch -ne $BaselineWorktree.Branch) { throw 'SAFETY VIOLATION: isolated worktree branch changed.' }
+    [void](Assert-ChangePolicy -WorkingDirectory $Worktree -Safety $Safety -GitExecutable $GitExecutable)
+    return $true
+}
+
+function Invoke-GitDiffCheck {
+    param(
+        [Parameter(Mandatory = $true)][string]$WorkingDirectory,
+        [Parameter(Mandatory = $true)][string]$GitExecutable,
+        [Parameter(Mandatory = $true)][string]$LogPath
+    )
+
+    $result = Invoke-NativeCapture -Command $GitExecutable -Arguments @('diff', '--check', 'HEAD') -WorkingDirectory $WorkingDirectory
+    Set-Content -LiteralPath $LogPath -Value ($result.StdOut + $result.StdErr) -Encoding utf8
+    return ($result.ExitCode -eq 0)
+}
+
+function Test-ClaudeEligibility {
+    param(
+        [Parameter(Mandatory = $true)][bool]$TestsPassed,
+        [Parameter(Mandatory = $true)][bool]$DiffCheckPassed,
+        [Parameter(Mandatory = $true)][bool]$PolicyPassed,
+        [Parameter(Mandatory = $true)][bool]$NoDeletedFiles,
+        [Parameter(Mandatory = $true)][bool]$StateStable,
+        [Parameter(Mandatory = $true)][int]$ClaudeCalls,
+        [Parameter(Mandatory = $true)][int]$MaxClaudeCalls
+    )
+
+    return ($TestsPassed -and $DiffCheckPassed -and $PolicyPassed -and $NoDeletedFiles -and $StateStable -and $ClaudeCalls -lt $MaxClaudeCalls)
+}
+
+function Invoke-ClaudeGate {
+    param(
+        [Parameter(Mandatory = $true)][bool]$TestsPassed,
+        [Parameter(Mandatory = $true)][bool]$DiffCheckPassed,
+        [Parameter(Mandatory = $true)][bool]$PolicyPassed,
+        [Parameter(Mandatory = $true)][bool]$NoDeletedFiles,
+        [Parameter(Mandatory = $true)][bool]$StateStable,
+        [Parameter(Mandatory = $true)][int]$ClaudeCalls,
+        [Parameter(Mandatory = $true)][int]$MaxClaudeCalls,
+        [Parameter(Mandatory = $true)][scriptblock]$Invocation
+    )
+
+    $eligible = Test-ClaudeEligibility -TestsPassed $TestsPassed -DiffCheckPassed $DiffCheckPassed -PolicyPassed $PolicyPassed -NoDeletedFiles $NoDeletedFiles -StateStable $StateStable -ClaudeCalls $ClaudeCalls -MaxClaudeCalls $MaxClaudeCalls
+    if (-not $eligible) { return [pscustomobject]@{ Called = $false; Result = $null } }
+    return [pscustomobject]@{ Called = $true; Result = (& $Invocation) }
+}
+
 function Expand-Prompt {
     param(
         [Parameter(Mandatory = $true)][string]$TemplatePath,
@@ -216,11 +391,17 @@ function Invoke-AgentStage {
         [Parameter(Mandatory = $true)]$Configuration,
         [Parameter(Mandatory = $true)][string]$Prompt,
         [Parameter(Mandatory = $true)][string]$WorkingDirectory,
-        [Parameter(Mandatory = $true)][string]$OutputPath
+        [Parameter(Mandatory = $true)][string]$OutputPath,
+        [hashtable]$Environment = @{}
     )
 
     Write-Step "Running $Name"
-    $result = Invoke-NativeCapture -Command ([string]$Configuration.command) -Arguments @($Configuration.arguments) -WorkingDirectory $WorkingDirectory -StandardInput $Prompt -TimeoutSeconds ([int]$Configuration.timeoutSeconds)
+    try {
+        $result = Invoke-NativeCapture -Command ([string]$Configuration.command) -Arguments @($Configuration.arguments) -WorkingDirectory $WorkingDirectory -StandardInput $Prompt -TimeoutSeconds ([int]$Configuration.timeoutSeconds) -Environment $Environment
+    }
+    catch {
+        $result = [pscustomobject]@{ ExitCode = -1; StdOut = ''; StdErr = $_.Exception.Message }
+    }
     $transcript = @(
         "# $Name",
         "",
@@ -235,10 +416,7 @@ function Invoke-AgentStage {
         $result.StdErr
     ) -join [Environment]::NewLine
     Set-Content -LiteralPath $OutputPath -Value $transcript -Encoding utf8
-    if ($result.ExitCode -ne 0) {
-        throw "$Name failed with exit code $($result.ExitCode). See $OutputPath"
-    }
-    return $result.StdOut
+    return [pscustomobject]@{ ExitCode = $result.ExitCode; Output = $result.StdOut; Error = $result.StdErr }
 }
 
 function Invoke-TestSuite {
@@ -252,7 +430,12 @@ function Invoke-TestSuite {
     $combined = @()
     foreach ($test in $Tests) {
         Write-Step "Running test: $($test.name)"
-        $result = Invoke-NativeCapture -Command ([string]$test.command) -Arguments @($test.arguments) -WorkingDirectory $WorkingDirectory -TimeoutSeconds ([int]$test.timeoutSeconds)
+        try {
+            $result = Invoke-NativeCapture -Command ([string]$test.command) -Arguments @($test.arguments) -WorkingDirectory $WorkingDirectory -TimeoutSeconds ([int]$test.timeoutSeconds)
+        }
+        catch {
+            $result = [pscustomobject]@{ ExitCode = -1; StdOut = ''; StdErr = $_.Exception.Message }
+        }
         $safeName = ([string]$test.name) -replace '[^A-Za-z0-9_.-]', '-'
         $logPath = Join-Path $OutputDirectory "test-$safeName.log"
         $log = "Exit code: $($result.ExitCode)`r`n`r`n$($result.StdOut)`r`n$($result.StdErr)"
@@ -260,17 +443,22 @@ function Invoke-TestSuite {
         $combined += "## $($test.name) (exit $($result.ExitCode))`n$($result.StdOut)`n$($result.StdErr)"
         if ($result.ExitCode -ne 0) { $allPassed = $false }
     }
-    return [pscustomobject]@{ Passed = $allPassed; Output = ($combined -join "`n`n") }
+    return [pscustomobject]@{ Passed = $allPassed; Output = ($combined -join "`n`n"); Count = @($Tests).Count }
 }
 
-$policyFullPath = [System.IO.Path]::GetFullPath($PolicyPath)
+if ($env:AGENT_LOOP_LIBRARY_ONLY -eq '1') {
+    return
+}
+
+$policyFullPath = Join-Path $PSScriptRoot 'policy.json'
 if (-not (Test-Path -LiteralPath $policyFullPath -PathType Leaf)) {
     throw "Policy file not found: $policyFullPath"
 }
 $policy = Get-Content -LiteralPath $policyFullPath -Raw | ConvertFrom-Json
 if ([int]$policy.version -ne 1) { throw "Unsupported policy version: $($policy.version)" }
 
-$repositoryResult = Invoke-NativeCapture -Command 'git' -Arguments @('rev-parse', '--show-toplevel') -WorkingDirectory $PSScriptRoot
+$gitExecutable = Resolve-GitExecutable
+$repositoryResult = Invoke-NativeCapture -Command $gitExecutable -Arguments @('rev-parse', '--show-toplevel') -WorkingDirectory $PSScriptRoot
 if ($repositoryResult.ExitCode -ne 0) { throw 'The automation directory is not inside a Git repository.' }
 $repositoryRoot = $repositoryResult.StdOut.Trim()
 
@@ -278,10 +466,39 @@ foreach ($relativePath in @($policy.execution.runDirectory) + @($policy.safety.a
     Assert-RelativeRepositoryPath -Path ([string]$relativePath)
 }
 
-if ($MaxIterations -eq 0) { $MaxIterations = [int]$policy.execution.maxIterations }
+$policyIterationLimit = [int]$policy.execution.maxIterations
+if ($policyIterationLimit -lt 1 -or $policyIterationLimit -gt 2) {
+    throw "Policy maxIterations must be between 1 and 2; found $policyIterationLimit."
+}
+if (-not $PSBoundParameters.ContainsKey('MaxIterations')) {
+    $MaxIterations = $policyIterationLimit
+}
+elseif ($MaxIterations -gt $policyIterationLimit) {
+    throw "MaxIterations $MaxIterations exceeds the policy limit $policyIterationLimit."
+}
+if ([int]$policy.execution.maxClaudeCalls -ne 1) { throw 'Policy maxClaudeCalls must equal 1.' }
+if ([int]$policy.safety.maxChangedFiles -lt 1 -or [int]$policy.safety.maxChangedFiles -gt 20) { throw 'Policy maxChangedFiles must be between 1 and 20.' }
+if ([int]$policy.safety.maxDiffLines -lt 1 -or [int]$policy.safety.maxDiffLines -gt 1000) { throw 'Policy maxDiffLines must be between 1 and 1000.' }
+if (@($policy.tests).Count -ne 2) { throw 'Policy must configure exactly two test suites.' }
+if (@($policy.safety.forbiddenGitArguments).Count -eq 0) { throw 'Policy forbiddenGitArguments must not be empty.' }
+
+$repositoryFullPath = [System.IO.Path]::GetFullPath($repositoryRoot).TrimEnd([char[]]@('\', '/'))
+if ([string]::IsNullOrWhiteSpace($WorktreeRoot)) {
+    $worktreeRootFullPath = [System.IO.Path]::GetFullPath((Join-Path $repositoryFullPath ([string]$policy.execution.runDirectory)))
+}
+elseif ([System.IO.Path]::IsPathRooted($WorktreeRoot)) {
+    $worktreeRootFullPath = [System.IO.Path]::GetFullPath($WorktreeRoot)
+}
+else {
+    $worktreeRootFullPath = [System.IO.Path]::GetFullPath((Join-Path $repositoryFullPath $WorktreeRoot))
+}
+$repositoryPrefix = $repositoryFullPath + [System.IO.Path]::DirectorySeparatorChar
+if (-not $worktreeRootFullPath.StartsWith($repositoryPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "WorktreeRoot must be inside the repository: $worktreeRootFullPath"
+}
+
 $runId = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ') + '-' + ([Guid]::NewGuid().ToString('N').Substring(0, 8))
-$runRoot = Join-Path $repositoryRoot ([string]$policy.execution.runDirectory)
-$runDirectory = Join-Path $runRoot $runId
+$runDirectory = Join-Path $worktreeRootFullPath $runId
 $worktreeDirectory = Join-Path $runDirectory 'worktree'
 $branchName = ([string]$policy.execution.branchPrefix) + $runId
 
@@ -299,6 +516,8 @@ if (-not $Execute) {
     Write-Step "Would create branch: $branchName"
     Write-Step "Would create worktree: $worktreeDirectory"
     Write-Step "Iterations: $MaxIterations"
+    Write-Step "Resolved git.exe: $gitExecutable"
+    Write-Step "Limits: Claude calls=1; changed files=$($policy.safety.maxChangedFiles); diff lines=$($policy.safety.maxDiffLines)"
     Write-Step "Stages: DeepSeek analysis -> Codex implementation -> tests -> DeepSeek triage (on failure) -> Claude review"
     Write-Step "Test commands: $(@($policy.tests | ForEach-Object { ([string]$_.command + ' ' + (@($_.arguments) -join ' ')).Trim() }) -join '; ')"
     exit 0
@@ -309,22 +528,42 @@ if ([bool]$policy.safety.neverCommit -ne $true -or [bool]$policy.safety.neverPus
 }
 
 if ([bool]$policy.execution.requireCleanWorktree) {
-    $initialChanges = @(Get-ChangedPaths -WorkingDirectory $repositoryRoot)
+    $initialChanges = @(Get-ChangedPaths -WorkingDirectory $repositoryRoot -GitExecutable $gitExecutable)
     if ($initialChanges.Count -gt 0) {
         throw "The primary worktree must be clean before execution. Found: $($initialChanges -join ', ')"
     }
 }
 
+$baselineMain = Get-GitSnapshot -WorkingDirectory $repositoryRoot -GitExecutable $gitExecutable
 New-Item -ItemType Directory -Path $runDirectory -Force | Out-Null
-$gitWorktree = Invoke-NativeCapture -Command 'git' -Arguments @('worktree', 'add', '-b', $branchName, $worktreeDirectory, 'HEAD') -WorkingDirectory $repositoryRoot
+$gitWorktree = Invoke-NativeCapture -Command $gitExecutable -Arguments @('worktree', 'add', '-b', $branchName, $worktreeDirectory, 'HEAD') -WorkingDirectory $repositoryRoot
 if ($gitWorktree.ExitCode -ne 0) { throw "Could not create isolated worktree: $($gitWorktree.StdErr)" }
+$baselineWorktree = Get-GitSnapshot -WorkingDirectory $worktreeDirectory -GitExecutable $gitExecutable
+$baselineRecord = [ordered]@{
+    recordedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+    mainRepository = @{ head = $baselineMain.Head; branch = $baselineMain.Branch; status = $baselineMain.Status }
+    worktree = @{ head = $baselineWorktree.Head; branch = $baselineWorktree.Branch; status = $baselineWorktree.Status }
+}
+$baselineRecord | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $runDirectory 'git-baseline.json') -Encoding utf8
+
+$guardDirectory = Join-Path $runDirectory 'git-guard'
+New-GitGuard -Directory $guardDirectory -RealGitExecutable $gitExecutable -ForbiddenArguments @($policy.safety.forbiddenGitArguments)
+$codexEnvironment = @{
+    PATH = $guardDirectory + [System.IO.Path]::PathSeparator + $env:PATH
+    GIT_TERMINAL_PROMPT = '0'
+    GCM_INTERACTIVE = 'Never'
+}
 
 $analysisTemplate = Join-Path $repositoryRoot ([string]$policy.agents.deepseekAnalysis.prompt)
-$analysisPrompt = Expand-Prompt -TemplatePath $analysisTemplate -Values @{ TASK = $Task; WORKSPACE = $worktreeDirectory }
-$analysisOutput = Invoke-AgentStage -Name 'DeepSeek analysis' -Configuration $policy.agents.deepseekAnalysis -Prompt $analysisPrompt -WorkingDirectory $worktreeDirectory -OutputPath (Join-Path $runDirectory 'analysis.md')
+$analysisPrompt = Expand-Prompt -TemplatePath $analysisTemplate -Values @{ TASK = $Requirement; WORKSPACE = $worktreeDirectory }
+$analysisStage = Invoke-AgentStage -Name 'DeepSeek analysis' -Configuration $policy.agents.deepseekAnalysis -Prompt $analysisPrompt -WorkingDirectory $worktreeDirectory -OutputPath (Join-Path $runDirectory 'analysis.md')
+[void](Assert-AgentPostconditions -BaselineMain $baselineMain -BaselineWorktree $baselineWorktree -MainRepository $repositoryRoot -Worktree $worktreeDirectory -Safety $policy.safety -GitExecutable $gitExecutable)
+if ($analysisStage.ExitCode -ne 0) { throw "DeepSeek analysis failed with exit code $($analysisStage.ExitCode). Worktree retained: $worktreeDirectory" }
+$analysisOutput = $analysisStage.Output
 
 $feedback = 'No prior implementation feedback.'
-$finalVerdict = 'NOT APPROVED'
+$finalVerdict = 'NOT_APPROVED'
+$claudeCalls = 0
 for ($iteration = 1; $iteration -le $MaxIterations; $iteration++) {
     $iterationDirectory = Join-Path $runDirectory ("iteration-{0:D2}" -f $iteration)
     New-Item -ItemType Directory -Path $iterationDirectory -Force | Out-Null
@@ -332,53 +571,76 @@ for ($iteration = 1; $iteration -le $MaxIterations; $iteration++) {
 
     $implementationTemplate = Join-Path $repositoryRoot ([string]$policy.agents.codexImplementation.prompt)
     $implementationPrompt = Expand-Prompt -TemplatePath $implementationTemplate -Values @{
-        TASK = $Task
+        TASK = $Requirement
         WORKSPACE = $worktreeDirectory
         ANALYSIS = $analysisOutput
         FEEDBACK = $feedback
     }
-    [void](Invoke-AgentStage -Name 'Codex implementation' -Configuration $policy.agents.codexImplementation -Prompt $implementationPrompt -WorkingDirectory $worktreeDirectory -OutputPath (Join-Path $iterationDirectory 'implementation.md'))
-    $changedPaths = @(Assert-ChangePolicy -WorkingDirectory $worktreeDirectory -Safety $policy.safety)
+    $implementationStage = Invoke-AgentStage -Name 'Codex implementation' -Configuration $policy.agents.codexImplementation -Prompt $implementationPrompt -WorkingDirectory $worktreeDirectory -OutputPath (Join-Path $iterationDirectory 'implementation.md') -Environment $codexEnvironment
+    $stateStable = Assert-AgentPostconditions -BaselineMain $baselineMain -BaselineWorktree $baselineWorktree -MainRepository $repositoryRoot -Worktree $worktreeDirectory -Safety $policy.safety -GitExecutable $gitExecutable
+    if ($implementationStage.ExitCode -ne 0) { throw "Codex implementation failed with exit code $($implementationStage.ExitCode). Worktree retained: $worktreeDirectory" }
+    $changedPaths = @(Assert-ChangePolicy -WorkingDirectory $worktreeDirectory -Safety $policy.safety -GitExecutable $gitExecutable)
+    $policyPassed = $true
+    $noDeletedFiles = -not (Test-HasDeletedFiles -WorkingDirectory $worktreeDirectory -GitExecutable $gitExecutable)
 
     $testResult = Invoke-TestSuite -Tests @($policy.tests) -WorkingDirectory $worktreeDirectory -OutputDirectory $iterationDirectory
+    $stateStable = Assert-AgentPostconditions -BaselineMain $baselineMain -BaselineWorktree $baselineWorktree -MainRepository $repositoryRoot -Worktree $worktreeDirectory -Safety $policy.safety -GitExecutable $gitExecutable
     $triage = 'All configured tests passed; no failure triage was required.'
     if (-not $testResult.Passed) {
         $triageTemplate = Join-Path $repositoryRoot ([string]$policy.agents.deepseekTestTriage.prompt)
         $triagePrompt = Expand-Prompt -TemplatePath $triageTemplate -Values @{
-            TASK = $Task
+            TASK = $Requirement
             WORKSPACE = $worktreeDirectory
             CHANGED_FILES = ($changedPaths -join "`n")
             TEST_OUTPUT = $testResult.Output
         }
-        $triage = Invoke-AgentStage -Name 'DeepSeek test triage' -Configuration $policy.agents.deepseekTestTriage -Prompt $triagePrompt -WorkingDirectory $worktreeDirectory -OutputPath (Join-Path $iterationDirectory 'test-triage.md')
-        if ([bool]$policy.execution.stopOnTestFailure) { break }
+        $triageStage = Invoke-AgentStage -Name 'DeepSeek test triage' -Configuration $policy.agents.deepseekTestTriage -Prompt $triagePrompt -WorkingDirectory $worktreeDirectory -OutputPath (Join-Path $iterationDirectory 'test-triage.md')
+        [void](Assert-AgentPostconditions -BaselineMain $baselineMain -BaselineWorktree $baselineWorktree -MainRepository $repositoryRoot -Worktree $worktreeDirectory -Safety $policy.safety -GitExecutable $gitExecutable)
+        if ($triageStage.ExitCode -ne 0) { throw "DeepSeek triage failed with exit code $($triageStage.ExitCode). Worktree retained: $worktreeDirectory" }
+        $triage = $triageStage.Output
+        $feedback = $triage
+        if ($iteration -eq $MaxIterations) { $finalVerdict = 'TEST_FAILED' }
+        continue
     }
 
-    $reviewDiff = Get-ReviewDiff -WorkingDirectory $worktreeDirectory
+    $diffCheckPassed = Invoke-GitDiffCheck -WorkingDirectory $worktreeDirectory -GitExecutable $gitExecutable -LogPath (Join-Path $iterationDirectory 'git-diff-check.log')
+    if (-not $diffCheckPassed) { throw "git diff --check failed. Worktree retained: $worktreeDirectory" }
+    $stateStable = Assert-AgentPostconditions -BaselineMain $baselineMain -BaselineWorktree $baselineWorktree -MainRepository $repositoryRoot -Worktree $worktreeDirectory -Safety $policy.safety -GitExecutable $gitExecutable
+    $noDeletedFiles = -not (Test-HasDeletedFiles -WorkingDirectory $worktreeDirectory -GitExecutable $gitExecutable)
+    $reviewDiff = Get-ReviewDiff -WorkingDirectory $worktreeDirectory -GitExecutable $gitExecutable
     $reviewTemplate = Join-Path $repositoryRoot ([string]$policy.agents.claudeReview.prompt)
     $reviewPrompt = Expand-Prompt -TemplatePath $reviewTemplate -Values @{
-        TASK = $Task
+        TASK = $Requirement
         WORKSPACE = $worktreeDirectory
         CHANGED_FILES = ($changedPaths -join "`n")
         DIFF = $reviewDiff
         TEST_OUTPUT = $testResult.Output
         TRIAGE = $triage
     }
-    $review = Invoke-AgentStage -Name 'Claude review' -Configuration $policy.agents.claudeReview -Prompt $reviewPrompt -WorkingDirectory $worktreeDirectory -OutputPath (Join-Path $iterationDirectory 'review.md')
-    $feedback = $review
-
-    if ($testResult.Passed -and $review.Contains([string]$policy.execution.approvalMarker)) {
-        $finalVerdict = 'APPROVED'
-        break
+    $claudeGate = Invoke-ClaudeGate -TestsPassed $testResult.Passed -DiffCheckPassed $diffCheckPassed -PolicyPassed $policyPassed -NoDeletedFiles $noDeletedFiles -StateStable $stateStable -ClaudeCalls $claudeCalls -MaxClaudeCalls ([int]$policy.execution.maxClaudeCalls) -Invocation {
+        Invoke-AgentStage -Name 'Claude review' -Configuration $policy.agents.claudeReview -Prompt $reviewPrompt -WorkingDirectory $worktreeDirectory -OutputPath (Join-Path $iterationDirectory 'review.md')
     }
+    if (-not $claudeGate.Called) { throw "Claude gate rejected the review stage. Worktree retained: $worktreeDirectory" }
+    $claudeCalls++
+    $reviewStage = $claudeGate.Result
+    [void](Assert-AgentPostconditions -BaselineMain $baselineMain -BaselineWorktree $baselineWorktree -MainRepository $repositoryRoot -Worktree $worktreeDirectory -Safety $policy.safety -GitExecutable $gitExecutable)
+    if ($reviewStage.ExitCode -ne 0) { throw "Claude review failed with exit code $($reviewStage.ExitCode). Worktree retained: $worktreeDirectory" }
+    $review = $reviewStage.Output
+
+    if ($review.Contains([string]$policy.execution.approvalMarker)) {
+        $finalVerdict = 'APPROVED'
+    }
+    else { $finalVerdict = 'CHANGES_REQUESTED' }
+    break
 }
 
 $summary = @(
     '# Agent loop summary',
     '',
     "Run: $runId",
-    "Task: $Task",
+    "Requirement: $Requirement",
     "Verdict: $finalVerdict",
+    "Claude calls: $claudeCalls",
     "Branch: $branchName",
     "Worktree: $worktreeDirectory",
     '',
