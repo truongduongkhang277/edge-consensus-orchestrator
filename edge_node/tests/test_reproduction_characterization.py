@@ -51,15 +51,27 @@ class ReproductionCharacterizationTests(unittest.TestCase):
             finally:
                 node.stop()
 
-    @unittest.expectedFailure
     def test_leader_is_temporary_per_request(self):
         """Paper behavior: completed requests must release the temporary leader."""
         with tempfile.TemporaryDirectory() as data_dir:
-            node = self.make_node(data_dir)
+            node = RaftNode(
+                node_id="edge-1",
+                peers={},
+                data_dir=data_dir,
+            )
+            node.send_heartbeats = lambda: None
             try:
-                status, _ = node.orchestrate(deploy_command())
+                self.assertEqual(node.role, "follower")
+                status, first = node.orchestrate(deploy_command())
                 self.assertEqual(status, 201)
-                self.assertNotEqual(node.role, "leader")
+                self.assertEqual(node.role, "pause")
+                self.assertEqual(first["term"], 1)
+
+                status, second = node.orchestrate(deploy_command())
+                self.assertEqual(status, 201)
+                self.assertEqual(node.role, "pause")
+                self.assertEqual(second["term"], 2)
+                self.assertNotEqual(first["term"], second["term"])
             finally:
                 node.stop()
 
@@ -88,6 +100,7 @@ class ReproductionCharacterizationTests(unittest.TestCase):
                 self.assertEqual(node.log, [])
                 self.assertEqual(node.services, {})
                 self.assertEqual(reconciled, [])
+                self.assertEqual(node.role, "pause")
             finally:
                 node.stop()
 

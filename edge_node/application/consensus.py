@@ -436,8 +436,8 @@ class RaftNode:
                     self.HEARTBEAT_INTERVAL_SECONDS
                 )
 
-            elif expired:
-                self.begin_election()
+            # Leader chỉ tồn tại trong thời gian xử lý một orchestration
+            # request. Không tự bầu leader khi hệ thống đang idle.
 
     # ========================================================
     # LEADER ELECTION
@@ -466,7 +466,7 @@ class RaftNode:
         ) as error:
             return peer_id, None, error
 
-    def begin_election(self):
+    def begin_election(self, send_heartbeat: bool = True):
         with self.lock:
             self.role = "candidate"
             self.term += 1
@@ -538,7 +538,7 @@ class RaftNode:
                     response_term = int(result.get("term", 0))
                     if response_term > election_term:
                         self.become_follower(term=response_term)
-                        return
+                        return False
 
                     with self.lock:
                         still_candidate = (
@@ -581,8 +581,48 @@ class RaftNode:
                     )
                 )
 
-        if election_won:
+        if election_won and send_heartbeat:
             self.send_heartbeats()
+
+        return election_won
+
+    def _open_temporary_leader(self) -> bool:
+        """Bầu một leader mới cho đúng một orchestration request."""
+
+        with self.lock:
+            # Một số embedders khôi phục/tiêm một leader đã được bầu sẵn.
+            # Giữ quyền khởi tạo request đó nhưng vẫn mở term tạm thời mới;
+            # election mạng đầy đủ chỉ cần thiết khi node đang idle.
+            if self.role == "leader":
+                self.term += 1
+                self.voted_for = self.id
+                self.leader_id = self.id
+                self.last_heartbeat = time.monotonic()
+                self.election_timeout = self._new_timeout()
+                self._persist()
+                return True
+
+            self.role = "follower"
+            self.leader_id = None
+
+        return bool(self.begin_election(send_heartbeat=False))
+
+    def _pause_after_orchestration(self):
+        """Giải phóng leadership sau khi request thành công hoặc thất bại."""
+
+        with self.lock:
+            was_active = self.role in {"leader", "candidate"}
+            self.role = "pause"
+            self.leader_id = None
+            self.last_heartbeat = time.monotonic()
+
+            if was_active:
+                self._persist()
+
+                self.event(
+                    "PAUSE",
+                    f"Kết thúc orchestration tại {self.id}; tạm dừng Leader"
+                )
 
     def become_follower(
         self,
@@ -1199,7 +1239,11 @@ class RaftNode:
 
         with self.orchestration_lock:
             lock_acquired = time.perf_counter()
-            status_code, result = self._orchestrate_serialized(command)
+            try:
+                self._open_temporary_leader()
+                status_code, result = self._orchestrate_serialized(command)
+            finally:
+                self._pause_after_orchestration()
 
         request_finished = time.perf_counter()
         gateway_metrics = {
