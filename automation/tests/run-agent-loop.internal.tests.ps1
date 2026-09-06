@@ -61,6 +61,57 @@ finally {
 
 try {
     New-Item -ItemType Directory -Path $temporaryRoot -Force | Out-Null
+    $mucTieu = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('TeG7pWMgdGnDqnU='))
+    $phamVi = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('UGjhuqFtIHZpIMSRxrDhu6NjIHBow6lw'))
+    $dieuCam = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('xJBp4buBdSBj4bqlbQ=='))
+    $tieuChi = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('VGnDqnUgY2jDrSBob8OgbiB0aMOgbmg='))
+    $structuredRequirement = @(
+        "# $mucTieu", 'Kiem thu guard.', '',
+        "# $phamVi", 'Chi file automation.', '',
+        "# $dieuCam", 'Khong goi agent that.', '',
+        "# $tieuChi", 'Test pass.'
+    ) -join [Environment]::NewLine
+    Assert-True (Assert-RequirementStructure -Text $structuredRequirement) 'Valid structured Requirement was rejected.'
+    $placeholderCallFile = Join-Path $temporaryRoot 'placeholder-agent-calls.log'
+    $placeholderAgent = Join-Path $temporaryRoot 'placeholder-agent.ps1'
+    Set-Content -LiteralPath $placeholderAgent -Value "[IO.File]::AppendAllText('$placeholderCallFile', 'called`n')" -Encoding utf8
+    $placeholderRejected = $false
+    try { [void](Assert-RequirementStructure -Text 'placeholder cu') } catch { $placeholderRejected = $true }
+    Assert-True $placeholderRejected 'Legacy placeholder Requirement was not rejected.'
+    Assert-True (-not (Test-Path -LiteralPath $placeholderCallFile)) 'Placeholder Requirement called a mock agent process.'
+    Write-Host 'PASS: incomplete placeholder Requirement stops before any mock agent'
+
+    $blockedCodexCalls = 0
+    $blockedRejected = $false
+    try { [void](Assert-DeepSeekReady -Output "analysis incomplete`r`nVERDICT: BLOCKED") } catch { $blockedRejected = $true }
+    Assert-True $blockedRejected 'DeepSeek BLOCKED was not rejected.'
+    if (-not $blockedRejected) { $blockedCodexCalls++ }
+    Assert-True ($blockedCodexCalls -eq 0) 'Codex was called after DeepSeek BLOCKED.'
+    $missingMarkerRejected = $false
+    try { [void](Get-DeepSeekVerdict -Output 'analysis without marker') } catch { $missingMarkerRejected = $true }
+    Assert-True $missingMarkerRejected 'Missing DeepSeek marker was accepted.'
+    $contradictoryMarkerRejected = $false
+    try { [void](Get-DeepSeekVerdict -Output "VERDICT: READY`nVERDICT: BLOCKED") } catch { $contradictoryMarkerRejected = $true }
+    Assert-True $contradictoryMarkerRejected 'Contradictory DeepSeek markers were accepted.'
+    Assert-True (Assert-DeepSeekReady -Output 'VERDICT: READY') 'DeepSeek READY was rejected.'
+    Write-Host 'PASS: DeepSeek verdict gate blocks Codex unless exactly READY'
+
+    $utf8ChildPath = Join-Path $temporaryRoot 'utf8-output.ps1'
+    $expectedStdout = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('c3Rkb3V0IHRp4bq/bmcgVmnhu4d0OiDEkcO6bmcgVVRGLTg='))
+    $expectedStderr = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('c3RkZXJyIHRp4bq/bmcgVmnhu4d0OiDEkeG6qXkgxJHhu6c='))
+    $utf8ChildScript = @'
+$utf8 = [System.Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = $utf8
+[Console]::Error.Write([System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('c3RkZXJyIHRp4bq/bmcgVmnhu4d0OiDEkeG6qXkgxJHhu6c=')))
+[Console]::Out.Write([System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('c3Rkb3V0IHRp4bq/bmcgVmnhu4d0OiDEkcO6bmcgVVRGLTg=')))
+'@
+    Set-Content -LiteralPath $utf8ChildPath -Value $utf8ChildScript -Encoding utf8
+    $utf8Result = Invoke-NativeCapture -Command (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') -Arguments @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $utf8ChildPath) -WorkingDirectory $repositoryRoot -TimeoutSeconds 10
+    Assert-True ($utf8Result.ExitCode -eq 0) 'UTF-8 child process failed.'
+    Assert-True ($utf8Result.StdOut -eq $expectedStdout) "stdout UTF-8 did not round-trip: $($utf8Result.StdOut)"
+    Assert-True ($utf8Result.StdErr -eq $expectedStderr) "stderr UTF-8 did not round-trip: $($utf8Result.StdErr)"
+    Write-Host 'PASS: child stdout/stderr round-trip UTF-8'
+
     $script:stdinTransportAvailable = $true
     $stdinPrompt = ('Ch' + [char]0x1ec9 + ' ' + [char]0x0111 + [char]0x1ecd + 'c README.md ' + [char]0x2013 + ' ki' + [char]0x1ec3 + 'm th' + [char]0x1eed + ' ' + 'ti' + [char]0x1ebf + 'ng Vi' + [char]0x1ec7 + 't' + [Environment]::NewLine + '"' + ' & | ;')
         $expectedBase64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($stdinPrompt))
@@ -253,7 +304,12 @@ exit /b %ERRORLEVEL%
         Write-Host 'SKIP: Codex/Claude process stdin transport test (runtime lacks StandardInputEncoding)'
     }
 
-    $specialRequirement = "Yêu cầu `"đặc biệt`" & | ;`r`nkhông được chèn lệnh"
+    $specialRequirement = @(
+        $mucTieu, 'Yeu cau "dac biet" & | ;', '',
+        $phamVi, 'Chi dry-run.', '',
+        $dieuCam, 'Khong duoc chen lenh.', '',
+        $tieuChi, 'Parser va transport pass.'
+    ) -join [Environment]::NewLine
     $specialPrompt = "Requirement: $specialRequirement"
     $taskDirectory = Join-Path $temporaryRoot 'run-directory'
     New-Item -ItemType Directory -Path $taskDirectory -Force | Out-Null

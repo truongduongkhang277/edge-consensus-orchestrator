@@ -19,6 +19,35 @@ function Write-Step {
     Write-Host "[agent-loop] $Message"
 }
 
+function Get-RequirementStructureErrors {
+    param([AllowEmptyString()][string]$Text)
+
+    $requiredSections = @(
+        [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('TeG7pWMgdGnDqnU=')),
+        [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('UGjhuqFtIHZpIMSRxrDhu6NjIHBow6lw')),
+        [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('xJBp4buBdSBj4bqlbQ==')),
+        [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('VGnDqnUgY2jDrSBob8OgbiB0aMOgbmg='))
+    )
+    $errors = @()
+    foreach ($section in $requiredSections) {
+        $pattern = '(?im)^\s*#{0,6}\s*' + [Regex]::Escape($section) + '\s*:?[ \t]*$'
+        if ($Text -notmatch $pattern) {
+            $errors += "Requirement is missing required section: $section"
+        }
+    }
+    return @($errors)
+}
+
+function Assert-RequirementStructure {
+    param([AllowEmptyString()][string]$Text)
+
+    $errors = @(Get-RequirementStructureErrors -Text $Text)
+    if ($errors.Count -gt 0) {
+        throw ($errors -join '; ')
+    }
+    return $true
+}
+
 function ConvertTo-NativeArgument {
     param([AllowEmptyString()][string]$Argument)
 
@@ -66,6 +95,8 @@ function Invoke-NativeCapture {
     $startInfo.UseShellExecute = $false
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
+    $startInfo.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
+    $startInfo.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)
     $hasStandardInput = $PSBoundParameters.ContainsKey('StandardInput')
     $startInfo.RedirectStandardInput = $hasStandardInput
     $startInfo.CreateNoWindow = $true
@@ -489,6 +520,30 @@ function Invoke-DeepSeekStage {
     return (Invoke-AgentStage -Name $Name -Configuration $stageConfiguration -Prompt '' -WorkingDirectory $WorkingDirectory -OutputPath $OutputPath -Environment $Environment -NoStandardInput)
 }
 
+function Get-DeepSeekVerdict {
+    param([AllowEmptyString()][string]$Output)
+
+    $matches = [Regex]::Matches($Output, '(?im)^\s*VERDICT\s*:\s*([^\s]+)\s*$')
+    if ($matches.Count -ne 1) {
+        throw 'DeepSeek output must contain exactly one VERDICT: READY or VERDICT: BLOCKED marker.'
+    }
+    $verdict = $matches[0].Groups[1].Value.ToUpperInvariant()
+    if ($verdict -notin @('READY', 'BLOCKED')) {
+        throw "DeepSeek returned an invalid verdict marker: $verdict"
+    }
+    return $verdict
+}
+
+function Assert-DeepSeekReady {
+    param([AllowEmptyString()][string]$Output)
+
+    $verdict = Get-DeepSeekVerdict -Output $Output
+    if ($verdict -ne 'READY') {
+        throw 'DeepSeek verdict is BLOCKED; Codex will not be called.'
+    }
+    return $true
+}
+
 function Invoke-AgentStage {
     param(
         [Parameter(Mandatory = $true)][string]$Name,
@@ -559,6 +614,8 @@ function Invoke-TestSuite {
 if ($env:AGENT_LOOP_LIBRARY_ONLY -eq '1') {
     return
 }
+
+Assert-RequirementStructure -Text $Requirement
 
 $policyFullPath = Join-Path $PSScriptRoot 'policy.json'
 if (-not (Test-Path -LiteralPath $policyFullPath -PathType Leaf)) {
@@ -696,6 +753,7 @@ $analysisStage = Invoke-DeepSeekStage -Name 'DeepSeek analysis' -Configuration $
 [void](Assert-AgentPostconditions -BaselineMain $baselineMain -BaselineWorktree $baselineWorktree -MainRepository $repositoryRoot -Worktree $worktreeDirectory -Safety $policy.safety -GitExecutable $gitExecutable)
 if ($analysisStage.ExitCode -ne 0) { throw "DeepSeek analysis failed with exit code $($analysisStage.ExitCode). Worktree retained: $worktreeDirectory" }
 $analysisOutput = $analysisStage.Output
+[void](Assert-DeepSeekReady -Output $analysisOutput)
 
 $feedback = 'No prior implementation feedback.'
 $finalVerdict = 'NOT_APPROVED'

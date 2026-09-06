@@ -30,6 +30,12 @@ Workspace: `{{WORKSPACE}}`
 
 ## Tiêu chí review
 
+- Đối chiếu từng thay đổi trong diff với Requirement gốc ở trên; không thay
+  Requirement gốc bằng một diễn giải mới.
+- Đối chiếu từng tiêu chí hoàn thành trong Requirement gốc với diff, test,
+  `git diff --check` và bằng chứng được cung cấp. Tiêu chí thiếu bằng chứng là
+  finding và không được APPROVED.
+
 - Đúng chức năng và bao phủ đủ tiêu chí chấp nhận.
 - Không làm hỏng tính quyết định, an toàn đồng thuận, tương thích giao thức hoặc hành vi lỗi.
 - Không có lỗi bảo mật, rò rỉ bí mật, thao tác ngoài phạm vi hay thay đổi khó phục hồi.

@@ -42,6 +42,11 @@ Git wrapper không phải sandbox tuyệt đối: tiến trình có thể cố g
 
 ## Dry-run an toàn
 
+Requirement phải có đủ bốn mục: `Mục tiêu`, `Phạm vi được phép`, `Điều cấm` và
+`Tiêu chí hoàn thành`. Runner kiểm tra cấu trúc này trước khi đọc policy,
+resolve agent hoặc tạo worktree; Requirement thiếu mục sẽ fail ngay cả ở
+dry-run.
+
 Dry-run là mặc định và không tạo thư mục, branch, worktree, không gọi agent, không chạy test:
 
 ```powershell
@@ -87,6 +92,11 @@ Việc resolve từ `PATH` vẫn thuộc trust boundary của máy người dùn
 ## Cổng test và review
 
 Policy cấu hình đúng hai bộ test. Claude chỉ được gọi tối đa một lần và chỉ sau khi cả hai test exit code `0`, `git diff --check` đạt, policy đạt, không có file xóa, HEAD/branch không đổi và repository chính vẫn sạch.
+
+DeepSeek analysis phải kết thúc bằng đúng một `VERDICT: READY` hoặc
+`VERDICT: BLOCKED`. Thiếu marker, marker không hợp lệ hoặc có nhiều marker sẽ
+dừng vòng lặp; `BLOCKED` dừng trước khi gọi Codex. Claude được cung cấp
+Requirement gốc và phải đối chiếu diff cùng từng tiêu chí hoàn thành.
 
 Nếu test lỗi, runner gọi DeepSeek triage và chuyển kết quả cho vòng Codex kế tiếp; Claude không được gọi. Nếu hết tối đa hai vòng mà test vẫn lỗi, summary có trạng thái `TEST_FAILED`. Runner không commit, push, merge, xóa hoặc tự dọn worktree.
 
