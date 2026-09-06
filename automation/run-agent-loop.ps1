@@ -119,6 +119,56 @@ function Resolve-GitExecutable {
     return $resolved
 }
 
+function Resolve-AgentExecutable {
+    param(
+        [Parameter(Mandatory = $true)][string]$Command,
+        [Parameter(Mandatory = $true)][string]$RepositoryRoot,
+        [Parameter(Mandatory = $true)][string]$WorktreeRoot,
+        [Parameter(Mandatory = $true)][string]$RunDirectory
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Command)) {
+        throw 'Agent executable command cannot be empty.'
+    }
+
+    if ([System.IO.Path]::IsPathRooted($Command)) {
+        $candidate = [System.IO.Path]::GetFullPath($Command)
+    }
+    else {
+        $application = Get-Command -Name $Command -CommandType Application -ErrorAction Stop | Select-Object -First 1
+        if ($null -eq $application -or [string]::IsNullOrWhiteSpace([string]$application.Source)) {
+            throw "Could not resolve agent executable from PATH: $Command"
+        }
+        $resolvedSource = [string]$application.Source
+        if (-not [System.IO.Path]::IsPathRooted($resolvedSource)) {
+            throw "Get-Command returned a non-absolute agent executable path: $resolvedSource"
+        }
+        $candidate = [System.IO.Path]::GetFullPath($resolvedSource)
+    }
+
+    $repositoryPath = [System.IO.Path]::GetFullPath($RepositoryRoot).TrimEnd([char[]]@('\', '/'))
+    $worktreePath = [System.IO.Path]::GetFullPath($WorktreeRoot).TrimEnd([char[]]@('\', '/'))
+    $runPath = [System.IO.Path]::GetFullPath($RunDirectory).TrimEnd([char[]]@('\', '/'))
+    $candidatePrefixChecks = @(
+        @{ Name = 'repository root'; Path = $repositoryPath }
+        @{ Name = 'worktree root'; Path = $worktreePath }
+        @{ Name = 'run directory'; Path = $runPath }
+    )
+    foreach ($check in $candidatePrefixChecks) {
+        $prefix = $check.Path + [System.IO.Path]::DirectorySeparatorChar
+        if ($candidate.Equals($check.Path, [System.StringComparison]::OrdinalIgnoreCase) -or $candidate.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Agent executable is inside the protected $($check.Name): $candidate"
+        }
+    }
+    if (-not [System.IO.Path]::IsPathRooted($candidate)) {
+        throw "Resolved agent executable is not an absolute path: $candidate"
+    }
+    if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+        throw "Resolved agent executable does not exist: $candidate"
+    }
+    return $candidate
+}
+
 function New-GitGuard {
     param(
         [Parameter(Mandatory = $true)][string]$Directory,
@@ -446,10 +496,14 @@ function Invoke-AgentStage {
         [switch]$NoStandardInput
     )
 
+    $resolvedCommand = [string]$Configuration.command
     Write-Step "Running $Name"
     try {
+        if (-not [System.IO.Path]::IsPathRooted($resolvedCommand) -or -not (Test-Path -LiteralPath $resolvedCommand -PathType Leaf)) {
+            throw "Agent stage command must be an existing absolute path: $resolvedCommand"
+        }
         $standardInput = if ($NoStandardInput) { $null } else { $Prompt }
-        $result = Invoke-NativeCapture -Command ([string]$Configuration.command) -Arguments @($Configuration.arguments) -WorkingDirectory $WorkingDirectory -StandardInput $standardInput -TimeoutSeconds ([int]$Configuration.timeoutSeconds) -Environment $Environment
+        $result = Invoke-NativeCapture -Command $resolvedCommand -Arguments @($Configuration.arguments) -WorkingDirectory $WorkingDirectory -StandardInput $standardInput -TimeoutSeconds ([int]$Configuration.timeoutSeconds) -Environment $Environment
     }
     catch {
         $result = [pscustomobject]@{ ExitCode = -1; StdOut = ''; StdErr = $_.Exception.Message }
@@ -562,6 +616,24 @@ foreach ($promptName in $promptNames) {
     if (-not (Test-Path -LiteralPath $templatePath -PathType Leaf)) { throw "Prompt not found: $relativePrompt" }
 }
 
+$agentNames = @('deepseekAnalysis', 'codexImplementation', 'deepseekTestTriage', 'claudeReview')
+$resolvedAgentExecutables = @{}
+$agentConfigurations = @{}
+foreach ($agentName in $agentNames) {
+    try {
+        $resolvedPath = Resolve-AgentExecutable -Command ([string]$policy.agents.$agentName.command) -RepositoryRoot $repositoryFullPath -WorktreeRoot $worktreeRootFullPath -RunDirectory $runDirectory
+        $resolvedAgentExecutables[$agentName] = $resolvedPath
+        $agentConfigurations[$agentName] = [pscustomobject]@{
+            command = $resolvedPath
+            arguments = @($policy.agents.$agentName.arguments)
+            timeoutSeconds = [int]$policy.agents.$agentName.timeoutSeconds
+        }
+    }
+    catch {
+        if ($Execute) { throw "Could not resolve $agentName before execution: $($_.Exception.Message)" }
+    }
+}
+
 if (-not $Execute) {
     Write-Step 'DRY RUN: no files, branches, worktrees, agents, or tests will be created or executed.'
     Write-Step "Repository: $repositoryRoot"
@@ -569,6 +641,14 @@ if (-not $Execute) {
     Write-Step "Would create worktree: $worktreeDirectory"
     Write-Step "Iterations: $MaxIterations"
     Write-Step "Resolved git.exe: $gitExecutable"
+    foreach ($agentName in $agentNames) {
+        if ($resolvedAgentExecutables.ContainsKey($agentName)) {
+            Write-Step "Resolved $agentName executable: $($resolvedAgentExecutables[$agentName])"
+        }
+        else {
+            Write-Step "Unresolved $agentName executable (dry-run only)"
+        }
+    }
     Write-Step "Limits: Claude calls=1; changed files=$($policy.safety.maxChangedFiles); diff lines=$($policy.safety.maxDiffLines)"
     Write-Step "Stages: DeepSeek analysis -> Codex implementation -> tests -> DeepSeek triage (on failure) -> Claude review"
     Write-Step "Test commands: $(@($policy.tests | ForEach-Object { ([string]$_.command + ' ' + (@($_.arguments) -join ' ')).Trim() }) -join '; ')"
@@ -608,7 +688,7 @@ $codexEnvironment = @{
 
 $analysisTemplate = Join-Path $repositoryRoot ([string]$policy.agents.deepseekAnalysis.prompt)
 $analysisPrompt = Expand-Prompt -TemplatePath $analysisTemplate -Values @{ TASK = $Requirement; WORKSPACE = $worktreeDirectory }
-$analysisStage = Invoke-DeepSeekStage -Name 'DeepSeek analysis' -Configuration $policy.agents.deepseekAnalysis -Prompt $analysisPrompt -TaskFile (Join-Path $runDirectory 'deepseek-analysis.task.md') -WorkingDirectory $worktreeDirectory -OutputPath (Join-Path $runDirectory 'analysis.md')
+$analysisStage = Invoke-DeepSeekStage -Name 'DeepSeek analysis' -Configuration $agentConfigurations.deepseekAnalysis -Prompt $analysisPrompt -TaskFile (Join-Path $runDirectory 'deepseek-analysis.task.md') -WorkingDirectory $worktreeDirectory -OutputPath (Join-Path $runDirectory 'analysis.md')
 [void](Assert-AgentPostconditions -BaselineMain $baselineMain -BaselineWorktree $baselineWorktree -MainRepository $repositoryRoot -Worktree $worktreeDirectory -Safety $policy.safety -GitExecutable $gitExecutable)
 if ($analysisStage.ExitCode -ne 0) { throw "DeepSeek analysis failed with exit code $($analysisStage.ExitCode). Worktree retained: $worktreeDirectory" }
 $analysisOutput = $analysisStage.Output
@@ -628,7 +708,7 @@ for ($iteration = 1; $iteration -le $MaxIterations; $iteration++) {
         ANALYSIS = $analysisOutput
         FEEDBACK = $feedback
     }
-    $implementationStage = Invoke-AgentStage -Name 'Codex implementation' -Configuration $policy.agents.codexImplementation -Prompt $implementationPrompt -WorkingDirectory $worktreeDirectory -OutputPath (Join-Path $iterationDirectory 'implementation.md') -Environment $codexEnvironment
+    $implementationStage = Invoke-AgentStage -Name 'Codex implementation' -Configuration $agentConfigurations.codexImplementation -Prompt $implementationPrompt -WorkingDirectory $worktreeDirectory -OutputPath (Join-Path $iterationDirectory 'implementation.md') -Environment $codexEnvironment
     $stateStable = Assert-AgentPostconditions -BaselineMain $baselineMain -BaselineWorktree $baselineWorktree -MainRepository $repositoryRoot -Worktree $worktreeDirectory -Safety $policy.safety -GitExecutable $gitExecutable
     if ($implementationStage.ExitCode -ne 0) { throw "Codex implementation failed with exit code $($implementationStage.ExitCode). Worktree retained: $worktreeDirectory" }
     $changedPaths = @(Assert-ChangePolicy -WorkingDirectory $worktreeDirectory -Safety $policy.safety -GitExecutable $gitExecutable)
@@ -646,7 +726,7 @@ for ($iteration = 1; $iteration -le $MaxIterations; $iteration++) {
             CHANGED_FILES = ($changedPaths -join "`n")
             TEST_OUTPUT = $testResult.Output
         }
-        $triageStage = Invoke-DeepSeekStage -Name 'DeepSeek test triage' -Configuration $policy.agents.deepseekTestTriage -Prompt $triagePrompt -TaskFile (Join-Path $iterationDirectory 'deepseek-test-triage.task.md') -WorkingDirectory $worktreeDirectory -OutputPath (Join-Path $iterationDirectory 'test-triage.md')
+        $triageStage = Invoke-DeepSeekStage -Name 'DeepSeek test triage' -Configuration $agentConfigurations.deepseekTestTriage -Prompt $triagePrompt -TaskFile (Join-Path $iterationDirectory 'deepseek-test-triage.task.md') -WorkingDirectory $worktreeDirectory -OutputPath (Join-Path $iterationDirectory 'test-triage.md')
         [void](Assert-AgentPostconditions -BaselineMain $baselineMain -BaselineWorktree $baselineWorktree -MainRepository $repositoryRoot -Worktree $worktreeDirectory -Safety $policy.safety -GitExecutable $gitExecutable)
         if ($triageStage.ExitCode -ne 0) { throw "DeepSeek triage failed with exit code $($triageStage.ExitCode). Worktree retained: $worktreeDirectory" }
         $triage = $triageStage.Output
@@ -670,7 +750,7 @@ for ($iteration = 1; $iteration -le $MaxIterations; $iteration++) {
         TRIAGE = $triage
     }
     $claudeGate = Invoke-ClaudeGate -TestsPassed $testResult.Passed -DiffCheckPassed $diffCheckPassed -PolicyPassed $policyPassed -NoDeletedFiles $noDeletedFiles -StateStable $stateStable -ClaudeCalls $claudeCalls -MaxClaudeCalls ([int]$policy.execution.maxClaudeCalls) -Invocation {
-        Invoke-AgentStage -Name 'Claude review' -Configuration $policy.agents.claudeReview -Prompt $reviewPrompt -WorkingDirectory $worktreeDirectory -OutputPath (Join-Path $iterationDirectory 'review.md')
+        Invoke-AgentStage -Name 'Claude review' -Configuration $agentConfigurations.claudeReview -Prompt $reviewPrompt -WorkingDirectory $worktreeDirectory -OutputPath (Join-Path $iterationDirectory 'review.md')
     }
     if (-not $claudeGate.Called) { throw "Claude gate rejected the review stage. Worktree retained: $worktreeDirectory" }
     $claudeCalls++

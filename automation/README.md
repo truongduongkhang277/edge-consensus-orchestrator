@@ -35,6 +35,7 @@ Git wrapper không phải sandbox tuyệt đối: tiến trình có thể cố g
 
 - Chạy từ một Git repository sạch; lần chạy thật từ chối tiếp tục nếu worktree chính có thay đổi.
 - Các executable `git`, `python`, `codex`, `claude`, Node.js và `npx.cmd` phải có sẵn khi chạy thật. DeepSeek Harness phải khả dụng qua package `@deepseek-ai/dsh` phiên bản phù hợp.
+- Trước khi chạy agent, runner resolve từng CLI thành đường dẫn tuyệt đối bằng `Get-Command -CommandType Application` (hoặc kiểm tra trực tiếp nếu policy đã chứa đường dẫn tuyệt đối). Runner không hardcode thư mục cài Node.js; `-Execute` dừng trước khi tạo worktree nếu không resolve được executable.
 - Codex và Claude nhận prompt qua standard input. DeepSeek Harness headless nhận task positional; runner dùng task-file transport riêng được mô tả bên dưới.
 - Không đặt token hoặc credential trong policy, prompt hay command line. CLI tự quản lý xác thực bên ngoài repository.
 - Xem lại `allowedChangedPaths`, test command và timeout trước mỗi lần chạy thật.
@@ -80,6 +81,8 @@ npx.cmd @deepseek-ai/dsh --profile headless "Read the DeepSeek task file at <pat
 ```
 
 Runner ghi prompt UTF-8 vào task file dưới `.ai-runs/<run-id>/` chỉ khi có `-Execute`. Positional argument chỉ là chỉ dẫn ngắn kèm đường dẫn do runner tự tạo; Requirement không được đưa nguyên văn lên command line. Dry-run không ghi task file. Task file có thể chứa toàn bộ nội dung Requirement, vì vậy không đưa token, API key hoặc secret vào Requirement. Môi trường đã xác minh `@deepseek-ai/dsh` phiên bản `0.1.2-rc.1`; nếu pin version trong môi trường triển khai, giữ đúng version đã kiểm tra.
+
+Việc resolve từ `PATH` vẫn thuộc trust boundary của máy người dùng. Runner chỉ từ chối executable nằm dưới repository root, worktree root hoặc `.ai-runs`; nó không thể bảo vệ khỏi PATH bị kiểm soát ở cấp hệ điều hành.
 
 ## Cổng test và review
 

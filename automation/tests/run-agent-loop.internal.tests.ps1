@@ -40,6 +40,35 @@ try {
         Assert-True -Condition ((@($stage.arguments) -join ' ') -eq '@deepseek-ai/dsh --profile headless') -Message "$stageName has incorrect DSH arguments."
     }
     Write-Host 'PASS: DeepSeek stages resolve to npx.cmd headless profile'
+    $resolveWorktreeRoot = Join-Path $repositoryRoot '.ai-runs'
+    $resolveRunDirectory = Join-Path $resolveWorktreeRoot 'mock-run'
+    foreach ($stageName in @('deepseekAnalysis', 'codexImplementation', 'deepseekTestTriage', 'claudeReview')) {
+        $resolvedStagePath = Resolve-AgentExecutable -Command ([string]$policy.agents.$stageName.command) -RepositoryRoot $repositoryRoot -WorktreeRoot $resolveWorktreeRoot -RunDirectory $resolveRunDirectory
+        Assert-True ([System.IO.Path]::IsPathRooted($resolvedStagePath) -and (Test-Path -LiteralPath $resolvedStagePath -PathType Leaf)) "$stageName did not resolve to an existing absolute executable."
+    }
+    Write-Host 'PASS: all agent executables resolve to absolute existing paths'
+
+    $repoLocalRejected = $false
+    try { [void](Resolve-AgentExecutable -Command (Join-Path $repositoryRoot 'automation\run-agent-loop.ps1') -RepositoryRoot $repositoryRoot -WorktreeRoot $resolveWorktreeRoot -RunDirectory $resolveRunDirectory) } catch { $repoLocalRejected = $true }
+    Assert-True $repoLocalRejected 'Repository-local executable was not rejected.'
+    $runLocalRejected = $false
+    try { [void](Resolve-AgentExecutable -Command (Join-Path $resolveRunDirectory 'fake-agent.cmd') -RepositoryRoot $repositoryRoot -WorktreeRoot $resolveWorktreeRoot -RunDirectory $resolveRunDirectory) } catch { $runLocalRejected = $true }
+    Assert-True $runLocalRejected '.ai-runs executable was not rejected.'
+    $missingRejected = $false
+    try { [void](Resolve-AgentExecutable -Command 'agent-command-that-does-not-exist-automation-test' -RepositoryRoot $repositoryRoot -WorktreeRoot $resolveWorktreeRoot -RunDirectory $resolveRunDirectory) } catch { $missingRejected = $true }
+    Assert-True $missingRejected 'Missing executable was not rejected before worktree creation.'
+    Write-Host 'PASS: repo-local, .ai-runs and missing executables are rejected'
+
+    $npxCommand = Get-Command npx.cmd -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $npxCommand) {
+        Write-Host 'SKIP: npx.cmd ProcessStartInfo smoke check (not installed)'
+    }
+    else {
+        $resolvedNpx = Resolve-AgentExecutable -Command 'npx.cmd' -RepositoryRoot $repositoryRoot -WorktreeRoot $resolveWorktreeRoot -RunDirectory $resolveRunDirectory
+        $npxSmoke = Invoke-NativeCapture -Command $resolvedNpx -Arguments @('--version') -WorkingDirectory $repositoryRoot -TimeoutSeconds 10
+        Assert-True ($npxSmoke.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($npxSmoke.StdOut)) 'Resolved npx.cmd ProcessStartInfo smoke check failed.'
+        Write-Host 'PASS: resolved npx.cmd ProcessStartInfo smoke check'
+    }
     $script:guardRoot = Join-Path $temporaryRoot 'guard'
     $realGit = Resolve-GitExecutable
     New-GitGuard -Directory $script:guardRoot -RealGitExecutable $realGit -ForbiddenArguments @($policy.safety.forbiddenGitArguments)
