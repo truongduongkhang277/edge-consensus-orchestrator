@@ -34,8 +34,8 @@ Git wrapper không phải sandbox tuyệt đối: tiến trình có thể cố g
 ## Điều kiện
 
 - Chạy từ một Git repository sạch; lần chạy thật từ chối tiếp tục nếu worktree chính có thay đổi.
-- Các executable `git`, `python`, `deepseek`, `codex` và `claude` phải có sẵn trong `PATH` khi chạy thật.
-- CLI phải nhận prompt qua standard input. Có thể chỉnh tên lệnh/arguments trong `policy.json` theo CLI cục bộ.
+- Các executable `git`, `python`, `codex`, `claude`, Node.js và `npx.cmd` phải có sẵn khi chạy thật. DeepSeek Harness phải khả dụng qua package `@deepseek-ai/dsh` phiên bản phù hợp.
+- Codex và Claude nhận prompt qua standard input. DeepSeek Harness headless nhận task positional; runner dùng task-file transport riêng được mô tả bên dưới.
 - Không đặt token hoặc credential trong policy, prompt hay command line. CLI tự quản lý xác thực bên ngoài repository.
 - Xem lại `allowedChangedPaths`, test command và timeout trước mỗi lần chạy thật.
 
@@ -67,9 +67,19 @@ Chỉ dùng sau khi đã xem dry-run, bảo đảm repository sạch và xác nh
 .\automation\run-agent-loop.ps1 -Requirement "Mô tả thay đổi cần thực hiện" -Execute
 ```
 
-Giao diện script gồm đúng bốn tham số nghiệp vụ: `-Requirement` (bắt buộc), `-MaxIterations`, `-Execute` và `-WorktreeRoot`. `Requirement` được đưa vào prompt qua dữ liệu/standard input, không được ghép thành lệnh shell.
+Giao diện script gồm đúng bốn tham số nghiệp vụ: `-Requirement` (bắt buộc), `-MaxIterations`, `-Execute` và `-WorktreeRoot`. Requirement không được ghép thành lệnh shell.
 
 `-Execute` là công tắc duy nhất cho phép tạo `<WorktreeRoot>/<run-id>/`, branch và worktree. Nếu không chỉ định `-WorktreeRoot`, giá trị mặc định lấy từ `execution.runDirectory` trong policy (`.ai-runs`). Runner kiểm tra đường dẫn thay đổi sau mỗi lượt Codex và dừng ngay nếu file nằm ngoài allowlist, chạm protected path hoặc vượt giới hạn số file. `WorktreeRoot` phải nằm bên trong repository.
+
+### DeepSeek task-file transport
+
+Hai stage DeepSeek chạy bằng headless profile:
+
+```text
+npx.cmd @deepseek-ai/dsh --profile headless "Read the DeepSeek task file at <path> ..."
+```
+
+Runner ghi prompt UTF-8 vào task file dưới `.ai-runs/<run-id>/` chỉ khi có `-Execute`. Positional argument chỉ là chỉ dẫn ngắn kèm đường dẫn do runner tự tạo; Requirement không được đưa nguyên văn lên command line. Dry-run không ghi task file. Task file có thể chứa toàn bộ nội dung Requirement, vì vậy không đưa token, API key hoặc secret vào Requirement. Môi trường đã xác minh `@deepseek-ai/dsh` phiên bản `0.1.2-rc.1`; nếu pin version trong môi trường triển khai, giữ đúng version đã kiểm tra.
 
 ## Cổng test và review
 

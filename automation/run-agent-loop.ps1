@@ -385,19 +385,71 @@ function Expand-Prompt {
     return $content
 }
 
-function Invoke-AgentStage {
+function Write-DeepSeekTaskFile {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Prompt
+    )
+
+    $parent = Split-Path -Parent $Path
+    if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
+        throw "DeepSeek task directory does not exist: $parent"
+    }
+    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+    [System.IO.File]::WriteAllText($Path, $Prompt, $utf8NoBom)
+}
+
+function Get-DeepSeekInvocation {
+    param(
+        [Parameter(Mandatory = $true)]$Configuration,
+        [Parameter(Mandatory = $true)][string]$TaskFile
+    )
+
+    if ([string]::IsNullOrWhiteSpace($TaskFile)) { throw 'DeepSeek task file path cannot be empty.' }
+    $instruction = 'Read the DeepSeek task file at "' + $TaskFile + '" and follow its instructions. Return only the requested analysis.'
+    return [pscustomobject]@{
+        Command = [string]$Configuration.command
+        Arguments = @($Configuration.arguments) + @($instruction)
+        TaskFile = $TaskFile
+    }
+}
+
+function Invoke-DeepSeekStage {
     param(
         [Parameter(Mandatory = $true)][string]$Name,
         [Parameter(Mandatory = $true)]$Configuration,
-        [Parameter(Mandatory = $true)][string]$Prompt,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Prompt,
+        [Parameter(Mandatory = $true)][string]$TaskFile,
         [Parameter(Mandatory = $true)][string]$WorkingDirectory,
         [Parameter(Mandatory = $true)][string]$OutputPath,
         [hashtable]$Environment = @{}
     )
 
+    Write-DeepSeekTaskFile -Path $TaskFile -Prompt $Prompt
+    $invocation = Get-DeepSeekInvocation -Configuration $Configuration -TaskFile $TaskFile
+    $stageConfiguration = [pscustomobject]@{
+        command = $invocation.Command
+        arguments = $invocation.Arguments
+        timeoutSeconds = $Configuration.timeoutSeconds
+    }
+    return (Invoke-AgentStage -Name $Name -Configuration $stageConfiguration -Prompt '' -WorkingDirectory $WorkingDirectory -OutputPath $OutputPath -Environment $Environment -NoStandardInput)
+}
+
+function Invoke-AgentStage {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)]$Configuration,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Prompt,
+        [Parameter(Mandatory = $true)][string]$WorkingDirectory,
+        [Parameter(Mandatory = $true)][string]$OutputPath,
+        [hashtable]$Environment = @{},
+        [switch]$NoStandardInput
+    )
+
     Write-Step "Running $Name"
     try {
-        $result = Invoke-NativeCapture -Command ([string]$Configuration.command) -Arguments @($Configuration.arguments) -WorkingDirectory $WorkingDirectory -StandardInput $Prompt -TimeoutSeconds ([int]$Configuration.timeoutSeconds) -Environment $Environment
+        $standardInput = if ($NoStandardInput) { $null } else { $Prompt }
+        $result = Invoke-NativeCapture -Command ([string]$Configuration.command) -Arguments @($Configuration.arguments) -WorkingDirectory $WorkingDirectory -StandardInput $standardInput -TimeoutSeconds ([int]$Configuration.timeoutSeconds) -Environment $Environment
     }
     catch {
         $result = [pscustomobject]@{ ExitCode = -1; StdOut = ''; StdErr = $_.Exception.Message }
@@ -556,7 +608,7 @@ $codexEnvironment = @{
 
 $analysisTemplate = Join-Path $repositoryRoot ([string]$policy.agents.deepseekAnalysis.prompt)
 $analysisPrompt = Expand-Prompt -TemplatePath $analysisTemplate -Values @{ TASK = $Requirement; WORKSPACE = $worktreeDirectory }
-$analysisStage = Invoke-AgentStage -Name 'DeepSeek analysis' -Configuration $policy.agents.deepseekAnalysis -Prompt $analysisPrompt -WorkingDirectory $worktreeDirectory -OutputPath (Join-Path $runDirectory 'analysis.md')
+$analysisStage = Invoke-DeepSeekStage -Name 'DeepSeek analysis' -Configuration $policy.agents.deepseekAnalysis -Prompt $analysisPrompt -TaskFile (Join-Path $runDirectory 'deepseek-analysis.task.md') -WorkingDirectory $worktreeDirectory -OutputPath (Join-Path $runDirectory 'analysis.md')
 [void](Assert-AgentPostconditions -BaselineMain $baselineMain -BaselineWorktree $baselineWorktree -MainRepository $repositoryRoot -Worktree $worktreeDirectory -Safety $policy.safety -GitExecutable $gitExecutable)
 if ($analysisStage.ExitCode -ne 0) { throw "DeepSeek analysis failed with exit code $($analysisStage.ExitCode). Worktree retained: $worktreeDirectory" }
 $analysisOutput = $analysisStage.Output
@@ -594,7 +646,7 @@ for ($iteration = 1; $iteration -le $MaxIterations; $iteration++) {
             CHANGED_FILES = ($changedPaths -join "`n")
             TEST_OUTPUT = $testResult.Output
         }
-        $triageStage = Invoke-AgentStage -Name 'DeepSeek test triage' -Configuration $policy.agents.deepseekTestTriage -Prompt $triagePrompt -WorkingDirectory $worktreeDirectory -OutputPath (Join-Path $iterationDirectory 'test-triage.md')
+        $triageStage = Invoke-DeepSeekStage -Name 'DeepSeek test triage' -Configuration $policy.agents.deepseekTestTriage -Prompt $triagePrompt -TaskFile (Join-Path $iterationDirectory 'deepseek-test-triage.task.md') -WorkingDirectory $worktreeDirectory -OutputPath (Join-Path $iterationDirectory 'test-triage.md')
         [void](Assert-AgentPostconditions -BaselineMain $baselineMain -BaselineWorktree $baselineWorktree -MainRepository $repositoryRoot -Worktree $worktreeDirectory -Safety $policy.safety -GitExecutable $gitExecutable)
         if ($triageStage.ExitCode -ne 0) { throw "DeepSeek triage failed with exit code $($triageStage.ExitCode). Worktree retained: $worktreeDirectory" }
         $triage = $triageStage.Output
