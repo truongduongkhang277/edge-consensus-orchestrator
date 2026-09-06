@@ -2,7 +2,38 @@
 
 Nguyên mẫu triển khai nội dung trong slide: Raft leader election, heartbeat, distributed log và các lệnh điều phối `DEPLOY`, `MIGRATE`, `REPLICATE`.
 
-## Chạy nhanh bằng Docker
+## Hai chế độ container runtime
+
+Runtime mặc định chạy ở **chế độ mô phỏng**. Khi
+`EDGE_ENABLE_CONTAINER_RUNTIME` không được đặt hoặc có giá trị `false`, tiến
+trình chỉ cập nhật desired state qua Raft và state machine; nó không tạo Docker
+client, không ping Docker daemon, không tạo reconciler và không thực hiện thao
+tác tạo, chạy hay xóa container. Đây là chế độ phù hợp để phát triển, demo Raft
+và chạy kiểm thử mà không cần Docker.
+
+Để chủ động bật **Docker thật**, đặt biến môi trường trước khi khởi động node:
+
+```powershell
+$env:EDGE_ENABLE_CONTAINER_RUNTIME = "true"
+python -m edge_node --id edge-1 --port 8001
+```
+
+Trên shell tương thích POSIX:
+
+```bash
+EDGE_ENABLE_CONTAINER_RUNTIME=true python -m edge_node --id edge-1 --port 8001
+```
+
+Các giá trị bật được chấp nhận là `1`, `true`, `yes` và `on` (không phân biệt
+hoa thường). Chế độ này giữ nguyên Docker integration hiện có và yêu cầu Docker
+daemon đang chạy cùng quyền truy cập phù hợp. Đặt lại biến thành `false` hoặc
+gỡ biến để quay về mô phỏng.
+
+## Chạy nhanh cụm ứng dụng bằng Docker Compose
+
+Docker Compose bên dưới chỉ đóng gói và chạy ba tiến trình node. Container
+runtime bên trong mỗi node vẫn ở chế độ mô phỏng mặc định vì cấu hình
+`EDGE_ENABLE_CONTAINER_RUNTIME` chưa được bật.
 
 ```bash
 docker compose up --build
@@ -73,4 +104,3 @@ curl http://localhost:8001/services
 ```bash
 python -m unittest discover -s tests -v
 ```
-

@@ -1,17 +1,30 @@
+from __future__ import annotations
+
 import argparse
 import os
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .application.consensus import RaftNode
 from .presentation.http_server import (
     create_http_server
 )
-from .application.container_reconciler import (
-    ContainerReconciler
+
+if TYPE_CHECKING:
+    from .application.container_reconciler import (
+        ContainerReconciler
+    )
+
+
+CONTAINER_RUNTIME_ENV = (
+    "EDGE_ENABLE_CONTAINER_RUNTIME"
 )
-from .infrastructure.docker_engine import (
-    DockerEngine
-)
+ENABLED_ENV_VALUES = {
+    "1",
+    "true",
+    "yes",
+    "on"
+}
 
 
 def parse_peers(
@@ -103,17 +116,49 @@ def create_argument_parser():
 
     return parser
 
+
+def is_container_runtime_enabled() -> bool:
+    """
+    Docker runtime chỉ được bật bằng cấu hình chủ động.
+    """
+
+    configured_value = os.getenv(
+        CONTAINER_RUNTIME_ENV,
+        "false"
+    )
+
+    return (
+        configured_value.strip().lower()
+        in ENABLED_ENV_VALUES
+    )
+
 def create_container_reconciler(
     node_id: str
 ) -> ContainerReconciler | None:
     """
-    Khởi tạo Docker integration.
+    Khởi tạo Docker integration khi được bật rõ ràng.
 
-    Nếu Docker không chạy thì Raft vẫn hoạt động,
-    nhưng runtime container sẽ bị vô hiệu hóa.
+    Chế độ mặc định không import adapter Docker, không tạo
+    Docker client và không ping daemon. Raft cùng state machine
+    mô phỏng vẫn hoạt động bình thường.
     """
 
+    if not is_container_runtime_enabled():
+        print(
+            f"[{node_id}] Container runtime disabled; "
+            "using simulation mode"
+        )
+
+        return None
+
     try:
+        from .application.container_reconciler import (
+            ContainerReconciler
+        )
+        from .infrastructure.docker_engine import (
+            DockerEngine
+        )
+
         docker_engine = DockerEngine()
 
         if not docker_engine.ping():
