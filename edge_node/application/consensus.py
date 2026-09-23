@@ -418,11 +418,64 @@ class RaftNode:
         self.reconcile_event.set()
 
     def _election_loop(self):
+        """
+        Duy trì heartbeat của Leader và tự động bầu Leader mới
+        khi không nhận được heartbeat trong thời gian quy định.
+        """
+        heartbeat_interval = 0.5
+
         while self.running:
             time.sleep(0.1)
-            # Leader chỉ tồn tại trong thời gian xử lý một orchestration
-            # request. Không tự bầu leader khi hệ thống đang idle.
 
+            should_send_heartbeat = False
+            should_start_election = False
+
+            with self.lock:
+                now = time.monotonic()
+
+                if self.role == "leader":
+                    if now - self.last_heartbeat >= heartbeat_interval:
+                        should_send_heartbeat = True
+
+                elif self.role in {"follower", "pause"}:
+                    # Không kiểm tra leader_id is None.
+                    # Leader có thể đã dừng nhưng leader_id vẫn còn giá trị cũ.
+                    heartbeat_expired = (
+                        now - self.last_heartbeat
+                        >= self.election_timeout
+                    )
+
+                    if heartbeat_expired:
+                        self.leader_id = None
+                        should_start_election = True
+
+            if should_send_heartbeat:
+                try:
+                    self.send_heartbeats()
+
+                    with self.lock:
+                        self.last_heartbeat = time.monotonic()
+
+                except Exception as error:
+                    self.event(
+                        "HEARTBEAT_ERROR",
+                        f"Lỗi gửi heartbeat: {error}"
+                    )
+
+            elif should_start_election:
+                try:
+                    self.event(
+                        "ELECTION_TIMEOUT",
+                        "Không nhận được heartbeat; bắt đầu bầu Leader mới"
+                    )
+
+                    self.begin_election(send_heartbeat=True)
+
+                except Exception as error:
+                    self.event(
+                        "ELECTION_ERROR",
+                        f"Lỗi bầu Leader mới: {error}"
+                    )
     # ========================================================
     # LEADER ELECTION
     # ========================================================
@@ -1224,6 +1277,7 @@ class RaftNode:
                     status_code, result = self._orchestrate_serialized(command)
             finally:
                 self._pause_after_orchestration()
+                #pass
 
         request_finished = time.perf_counter()
         gateway_metrics = {
