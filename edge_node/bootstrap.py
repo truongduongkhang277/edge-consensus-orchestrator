@@ -9,6 +9,7 @@ from .application.consensus import RaftNode
 from .presentation.http_server import (
     create_http_server
 )
+from .logging_utils import get_logger
 
 if TYPE_CHECKING:
     from .application.container_reconciler import (
@@ -25,6 +26,8 @@ ENABLED_ENV_VALUES = {
     "yes",
     "on"
 }
+
+logger = get_logger(__name__)
 
 
 def parse_peers(
@@ -133,7 +136,10 @@ def is_container_runtime_enabled() -> bool:
     )
 
 def create_container_reconciler(
-    node_id: str
+    node_id: str,
+    *,
+    docker_engine_factory=None,
+    reconciler_factory=None,
 ) -> ContainerReconciler | None:
     """
     Khởi tạo Docker integration khi được bật rõ ràng.
@@ -144,45 +150,35 @@ def create_container_reconciler(
     """
 
     if not is_container_runtime_enabled():
-        print(
-            f"[{node_id}] Container runtime disabled; "
-            "using simulation mode"
-        )
+        logger.info("container runtime disabled; using simulation mode")
 
         return None
 
     try:
-        from .application.container_reconciler import (
-            ContainerReconciler
-        )
-        from .infrastructure.docker_engine import (
-            DockerEngine
-        )
+        if docker_engine_factory is None:
+            from .infrastructure.docker_engine import DockerEngine
+            docker_engine_factory = DockerEngine
 
-        docker_engine = DockerEngine()
+        if reconciler_factory is None:
+            from .application.container_reconciler import ContainerReconciler
+            reconciler_factory = ContainerReconciler
+
+        docker_engine = docker_engine_factory()
 
         if not docker_engine.ping():
-            print(
-                f"[{node_id}] Docker Engine "
-                "không phản hồi; chỉ chạy consensus"
-            )
+            logger.warning("Docker Engine unavailable; continuing consensus only")
 
             return None
 
-        print(
-            f"[{node_id}] Docker Engine đã kết nối"
-        )
+        logger.info("Docker Engine connected")
 
-        return ContainerReconciler(
+        return reconciler_factory(
             node_id=node_id,
             container_engine=docker_engine
         )
 
-    except Exception as error:
-        print(
-            f"[{node_id}] Không thể kết nối Docker: "
-            f"{error}"
-        )
+    except Exception:
+        logger.error("Docker runtime initialization failed")
 
         return None
 
@@ -217,32 +213,21 @@ def main():
         port=arguments.port
     )
 
-    print(
-        f"{arguments.id} đang chạy tại "
-        f"http://{arguments.host}:"
-        f"{arguments.port}"
-    )
+    logger.info("node started on configured host and port")
 
-    print(
-        f"Các nút ngang hàng: "
-        f"{list(peers)}"
-    )
+    logger.info("peer configuration loaded")
 
     try:
         server.serve_forever()
 
     except KeyboardInterrupt:
-        print(
-            f"\nĐang dừng {arguments.id}..."
-        )
+        logger.info("node shutdown requested")
 
     finally:
         node.stop()
         server.server_close()
 
-        print(
-            f"Đã dừng {arguments.id}"
-        )
+        logger.info("node stopped")
 
 
 if __name__ == "__main__":

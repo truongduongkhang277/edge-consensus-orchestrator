@@ -1,6 +1,6 @@
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from edge_node.bootstrap import (
     CONTAINER_RUNTIME_ENV,
@@ -17,18 +17,17 @@ class ContainerRuntimeGuardTests(unittest.TestCase):
         }
 
         with patch.dict(os.environ, environment, clear=True):
-            with patch(
-                "edge_node.infrastructure.docker_engine.docker.from_env"
-            ) as docker_from_env:
-                with patch(
-                    "edge_node.application.container_reconciler."
-                    "ContainerReconciler"
-                ) as reconciler_class:
-                    reconciler = create_container_reconciler("edge-1")
+            docker_factory = MagicMock()
+            reconciler_factory = MagicMock()
+            reconciler = create_container_reconciler(
+                "edge-1",
+                docker_engine_factory=docker_factory,
+                reconciler_factory=reconciler_factory,
+            )
 
         self.assertIsNone(reconciler)
-        docker_from_env.assert_not_called()
-        reconciler_class.assert_not_called()
+        self.assertFalse(docker_factory.called)
+        self.assertFalse(reconciler_factory.called)
 
     def test_false_value_never_calls_docker(self):
         with patch.dict(
@@ -36,13 +35,17 @@ class ContainerRuntimeGuardTests(unittest.TestCase):
             {CONTAINER_RUNTIME_ENV: "false"},
             clear=False,
         ):
-            with patch(
-                "edge_node.infrastructure.docker_engine.docker.from_env"
-            ) as docker_from_env:
-                reconciler = create_container_reconciler("edge-1")
+            docker_factory = MagicMock()
+            reconciler_factory = MagicMock()
+            reconciler = create_container_reconciler(
+                "edge-1",
+                docker_engine_factory=docker_factory,
+                reconciler_factory=reconciler_factory,
+            )
 
         self.assertIsNone(reconciler)
-        docker_from_env.assert_not_called()
+        self.assertFalse(docker_factory.called)
+        self.assertFalse(reconciler_factory.called)
 
     def test_enabled_mode_keeps_existing_docker_flow(self):
         with patch.dict(
@@ -50,18 +53,15 @@ class ContainerRuntimeGuardTests(unittest.TestCase):
             {CONTAINER_RUNTIME_ENV: "true"},
             clear=False,
         ):
-            with patch(
-                "edge_node.infrastructure.docker_engine.DockerEngine"
-            ) as docker_engine_class:
-                with patch(
-                    "edge_node.application.container_reconciler."
-                    "ContainerReconciler"
-                ) as reconciler_class:
-                    with patch("builtins.print"):
-                        docker_engine = docker_engine_class.return_value
-                        docker_engine.ping.return_value = True
-
-                        reconciler = create_container_reconciler("edge-1")
+            docker_engine_class = MagicMock()
+            reconciler_class = MagicMock()
+            docker_engine = docker_engine_class.return_value
+            docker_engine.ping.return_value = True
+            reconciler = create_container_reconciler(
+                "edge-1",
+                docker_engine_factory=docker_engine_class,
+                reconciler_factory=reconciler_class,
+            )
 
         docker_engine_class.assert_called_once_with()
         docker_engine.ping.assert_called_once_with()
@@ -70,6 +70,27 @@ class ContainerRuntimeGuardTests(unittest.TestCase):
             container_engine=docker_engine,
         )
         self.assertIs(reconciler, reconciler_class.return_value)
+
+    def test_enabled_mode_accepts_injected_factories(self):
+        class FakeEngine:
+            def ping(self):
+                return True
+
+        engine = FakeEngine()
+        reconciler = object()
+
+        with patch.dict(
+            os.environ,
+            {CONTAINER_RUNTIME_ENV: "true"},
+            clear=False,
+        ):
+            result = create_container_reconciler(
+                "edge-1",
+                docker_engine_factory=lambda: engine,
+                reconciler_factory=lambda **kwargs: reconciler,
+            )
+
+        self.assertIs(result, reconciler)
 
 
 if __name__ == "__main__":

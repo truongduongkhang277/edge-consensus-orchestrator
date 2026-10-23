@@ -1,27 +1,20 @@
+import logging
 import threading
 import time
 from collections import deque
 from datetime import datetime
+from ..logging_utils import get_logger
 
 
-def _print_safely(line: str) -> None:
-    """
-    Không để encoding của stdout làm gián đoạn luồng nghiệp vụ.
-    """
+logger = get_logger(__name__)
 
-    try:
-        print(line, flush=True)
-    except UnicodeEncodeError:
-        fallback_line = line.encode(
-            "ascii",
-            errors="backslashreplace"
-        ).decode("ascii")
 
-        try:
-            print(fallback_line, flush=True)
-        except UnicodeEncodeError:
-            # Sự kiện đã được lưu; lỗi console không được phá luồng gọi.
-            pass
+def _log_level(kind: str) -> int:
+    if kind.endswith(("_ERROR", "_FAILED")):
+        return logging.ERROR
+    if kind.endswith("_WARNING") or kind.endswith("_TIMEOUT"):
+        return logging.WARNING
+    return logging.INFO
 
 
 class EventRecorder:
@@ -64,11 +57,13 @@ class EventRecorder:
         with self.lock:
             self.items.appendleft(event)
 
-        _print_safely(
-            f"[{event['time']}] "
-            f"[{self.node_id}] "
-            f"[{kind}] "
-            f"{message}"
+        logger.log(
+            _log_level(kind),
+            "[%s] [%s] %s",
+            self.node_id,
+            kind,
+            message,
+            extra={"event_kind": kind, "node_id": self.node_id},
         )
 
     def get_all(self) -> list[dict]:
